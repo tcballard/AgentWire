@@ -1,0 +1,34 @@
+[package]
+name = "agentwire"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+description = "A transparent recorder, inspector, and deterministic replay server for Codex App Server"
+license = "MIT"
+repository = "https://github.com/tcballard/AgentWire"
+keywords = ["codex", "json-rpc", "debugging", "replay", "developer-tools"]
+categories = ["command-line-utilities", "development-tools::debugging"]
+
+[dependencies]
+anyhow = "1.0"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+clap = { version = "4.5", features = ["derive"] }
+regex = "1.11"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+[dev-dependencies]
+tempfile = "3.12"
+
+[features]
+test-support = []
+
+[[bin]]
+name = "agentwire-mock-server"
+path = "tests/support/mock_app_server.rs"
+required-features = ["test-support"]
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

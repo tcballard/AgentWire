@@ -1,21 +1,20 @@
 # AgentWire
 
-**A protocol tap and deterministic replay server for Codex App Server.**
+**A native protocol tap and deterministic replay server for Codex App Server.**
 
-AgentWire sits transparently between a Codex App Server client and the
-`codex app-server` process. It records both directions of the newline-delimited
+AgentWire is a Rust binary that sits transparently between a Codex App Server
+client and `codex app-server`. It records both directions of the newline-delimited
 JSON protocol, redacts common credentials, provides a live browser inspector,
-and replays the captured server behaviour without another model call.
+and replays captured server behaviour without another model call.
 
 This is an independent community project. It is not affiliated with or endorsed
 by OpenAI.
 
-## Why
+## Install
 
-Codex App Server makes rich coding-agent clients possible, but protocol bugs are
-difficult to reproduce from screenshots or ordinary logs. A trace should be a
-small fixture that a maintainer can inspect, attach to an issue, and replay into
-the client that failed.
+```bash
+cargo install --git https://github.com/tcballard/AgentWire
+```
 
 ## Quick start
 
@@ -26,10 +25,10 @@ agentwire record --ui -- codex app-server
 ```
 
 The child process still receives the client's stdin and writes directly to the
-client's stdout. The tap writes a private, redacted JSONL trace and serves the
+client's stdout. AgentWire writes a private, redacted JSONL trace and serves the
 inspector at `http://127.0.0.1:4777`.
 
-Use an explicit trace path when creating a fixture:
+Use an explicit path when creating a fixture:
 
 ```bash
 agentwire record --trace login-flow.jsonl -- codex app-server
@@ -43,18 +42,26 @@ Replay the trace as a fake App Server:
 agentwire replay login-flow.jsonl
 ```
 
-Point the original client at that command. AgentWire validates the sequence of
-client methods, rewrites recorded response IDs to the IDs used by the current
-client, and emits the captured server messages deterministically.
+AgentWire validates the sequence of client methods, rewrites recorded response
+IDs to those used by the current client, and emits captured server messages
+deterministically.
 
 ## Try it without Codex
 
-The repository includes a tiny JSONL server:
+Build the binary and opt-in test server:
 
 ```bash
-PYTHONPATH=src python -m agentwire record --trace demo.jsonl -- \
-  python examples/mock_app_server.py
+cargo build --bins --features test-support
 ```
+
+On macOS or Linux:
+
+```bash
+target/debug/agentwire record --trace demo.jsonl -- \
+  target/debug/agentwire-mock-server
+```
+
+On Windows, add `.exe` to both executable paths.
 
 Paste these messages, then send EOF:
 
@@ -68,14 +75,15 @@ Paste these messages, then send EOF:
 Then inspect and replay:
 
 ```bash
-PYTHONPATH=src python -m agentwire inspect demo.jsonl
-PYTHONPATH=src python -m agentwire serve demo.jsonl
-PYTHONPATH=src python -m agentwire replay demo.jsonl
+target/debug/agentwire inspect demo.jsonl
+target/debug/agentwire serve demo.jsonl
+target/debug/agentwire replay demo.jsonl
 ```
 
 ## Trace format
 
-Each line is an independently readable event:
+Trace format version 1 is unchanged from the prototype. Each line is an
+independently readable event:
 
 ```json
 {
@@ -92,22 +100,15 @@ Each line is an independently readable event:
 }
 ```
 
-The format intentionally preserves the protocol message rather than inventing
-an observability schema. That makes a trace useful as both evidence and a replay
-fixture.
-
 ## Security boundary
 
-- Traces are created with owner-only permissions (`0600`) where supported.
-- Keys named like tokens, passwords, secrets, cookies, credentials, and API keys
-  are replaced before writing.
-- Bearer tokens, OpenAI-style secret keys, and secret-looking environment
-  assignments are redacted inside strings.
+- Trace files use owner-only permissions (`0600`) on Unix.
+- Token, password, secret, cookie, credential, and API-key fields are redacted.
+- Bearer tokens, OpenAI-style keys, and secret environment assignments are
+  redacted inside strings.
 - Original protocol bytes are forwarded in memory but are not retained.
-- Invalid non-JSON lines are represented only by their length; their contents
-  are not retained.
-- The inspector binds to loopback by default and sends restrictive browser
-  security headers.
+- Invalid non-JSON lines retain only their length.
+- The inspector binds to loopback by default and sends restrictive headers.
 
 Redaction is defense in depth, not a guarantee. Review a trace before sharing it.
 
@@ -115,18 +116,19 @@ Redaction is defense in depth, not a guarantee. Review a trace before sharing it
 
 - Codex App Server's JSONL stdio transport only.
 - Replay validates method order, not full application state.
-- Timing is immediate by default; use `--speed 1` to preserve recorded delays.
+- Timing is immediate by default; use `--speed 1` for recorded delays.
 - Binary attachments and experimental WebSocket transports are out of scope.
-- The browser inspector polls the trace file rather than using a live socket.
+- The browser inspector polls the trace rather than using a live socket.
 
 ## Development
 
-The runtime has no third-party dependencies.
-
 ```bash
-PYTHONPATH=src python -m unittest discover -s tests -v
-PYTHONPATH=src python -m agentwire doctor
+cargo fmt --all --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --all-targets --all-features
 ```
+
+CI runs the same gates on Linux, macOS, and Windows.
 
 ## License
 
