@@ -2,12 +2,8 @@ use serde_json::Value;
 use std::io::Write;
 use std::process::{Command, Output, Stdio};
 
-const CLIENT_INPUT: &str = concat!(
-    "{\"id\":1,\"method\":\"initialize\",\"params\":{\"clientInfo\":{\"name\":\"test\",\"version\":\"0.1\"}}}\n",
-    "{\"method\":\"initialized\"}\n",
-    "{\"id\":2,\"method\":\"thread/start\",\"params\":{\"cwd\":\".\"}}\n",
-    "{\"id\":3,\"method\":\"turn/start\",\"params\":{\"threadId\":\"thread-demo\",\"input\":[{\"type\":\"text\",\"text\":\"hello\"}]}}\n",
-);
+const CLIENT_INPUT: &str = include_str!("fixtures/client.jsonl");
+const CHANGED_CLIENT_INPUT: &str = include_str!("fixtures/client-changed.jsonl");
 
 fn run_with_input(command: &mut Command, input: &str) -> Output {
     let mut child = command
@@ -73,4 +69,55 @@ fn record_inspect_and_replay_round_trip() {
         String::from_utf8_lossy(&replay.stderr)
     );
     assert_eq!(replay.stdout, record.stdout);
+}
+
+#[test]
+fn diff_identifies_protocol_payload_regression() {
+    let directory = tempfile::tempdir().unwrap();
+    let left = directory.path().join("before.jsonl");
+    let right = directory.path().join("after.jsonl");
+    let agentwire = env!("CARGO_BIN_EXE_agentwire");
+    let mock = env!("CARGO_BIN_EXE_agentwire-mock-server");
+
+    for (trace, input) in [(&left, CLIENT_INPUT), (&right, CHANGED_CLIENT_INPUT)] {
+        let record = run_with_input(
+            Command::new(agentwire)
+                .arg("record")
+                .arg("--trace")
+                .arg(trace)
+                .arg("--")
+                .arg(mock),
+            input,
+        );
+        assert!(
+            record.status.success(),
+            "{}",
+            String::from_utf8_lossy(&record.stderr)
+        );
+    }
+
+    let equal = Command::new(agentwire)
+        .arg("diff")
+        .arg(&left)
+        .arg(&left)
+        .output()
+        .unwrap();
+    assert!(equal.status.success());
+    assert!(String::from_utf8_lossy(&equal.stdout).contains("protocol-equivalent"));
+
+    let changed = Command::new(agentwire)
+        .arg("diff")
+        .arg(&left)
+        .arg(&right)
+        .arg("--json")
+        .output()
+        .unwrap();
+    assert_eq!(changed.status.code(), Some(1));
+    let comparison: Value = serde_json::from_slice(&changed.stdout).unwrap();
+    assert_eq!(comparison["equal"], false);
+    assert_eq!(comparison["differences_found"], 1);
+    assert_eq!(
+        comparison["differences"][0]["changes"][0]["path"],
+        "/payload/params/input/0/text"
+    );
 }

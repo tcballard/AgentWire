@@ -2,6 +2,7 @@ use agentwire::core::{
     load_trace, method_of, parse_message, remember_request_id, rewrite_response_id, summarize,
     TraceRecorder,
 };
+use agentwire::diff::{compare_traces, ComparableEvent, TraceDiff};
 use agentwire::web::{serve_forever, WebServer};
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
@@ -45,6 +46,20 @@ enum Commands {
         trace: PathBuf,
         #[arg(long)]
         json: bool,
+    },
+    /// Compare two traces at the protocol event and payload level.
+    Diff {
+        left: PathBuf,
+        right: PathBuf,
+        /// Emit a machine-readable comparison.
+        #[arg(long)]
+        json: bool,
+        /// Compare transport request IDs instead of ignoring them.
+        #[arg(long)]
+        strict_ids: bool,
+        /// Maximum number of event differences to print.
+        #[arg(long, default_value_t = 20)]
+        max_differences: usize,
     },
     /// Act as a deterministic fake App Server from a trace.
     Replay {
@@ -175,6 +190,92 @@ fn inspect(trace: PathBuf, as_json: bool) -> Result<i32> {
     Ok(0)
 }
 
+fn event_label(event: Option<&ComparableEvent>) -> String {
+    let Some(event) = event else {
+        return "∅".into();
+    };
+    let direction = match event.direction.as_str() {
+        "client_to_server" => "client → server",
+        "server_to_client" => "server → client",
+        other => other,
+    };
+    let method = event.method.as_deref().unwrap_or("—");
+    format!("{direction}  {}  {method}", event.kind)
+}
+
+fn display_value(value: Option<&Value>) -> String {
+    value
+        .map(|value| serde_json::to_string(value).expect("JSON value must serialize"))
+        .unwrap_or_else(|| "∅".into())
+}
+
+fn print_trace_diff(comparison: &TraceDiff) {
+    if comparison.equal {
+        let id_note = if comparison.ignored_request_ids {
+            "; request IDs ignored"
+        } else {
+            ""
+        };
+        println!(
+            "traces are protocol-equivalent ({} events{id_note})",
+            comparison.left_events
+        );
+        return;
+    }
+    println!(
+        "traces differ: {} protocol event(s) differ ({} left, {} right)",
+        comparison.differences_found, comparison.left_events, comparison.right_events
+    );
+    for difference in &comparison.differences {
+        let stream = match difference.stream.as_str() {
+            "client_to_server" => "client → server",
+            "server_to_client" => "server → client",
+            other => other,
+        };
+        println!(
+            "\n@@ {stream} event {} · {} @@",
+            difference.event, difference.kind
+        );
+        println!("- {}", event_label(difference.left.as_ref()));
+        println!("+ {}", event_label(difference.right.as_ref()));
+        for change in &difference.changes {
+            println!("  {}", change.path);
+            println!("    - {}", display_value(change.left.as_ref()));
+            println!("    + {}", display_value(change.right.as_ref()));
+        }
+    }
+    if comparison.truncated {
+        println!(
+            "\n… {} more event difference(s); raise --max-differences to show them",
+            comparison.differences_found - comparison.differences.len()
+        );
+    }
+}
+
+fn diff(
+    left: PathBuf,
+    right: PathBuf,
+    as_json: bool,
+    strict_ids: bool,
+    max_differences: usize,
+) -> Result<i32> {
+    if max_differences == 0 {
+        bail!("--max-differences must be at least 1");
+    }
+    let comparison = compare_traces(
+        &load_trace(&left)?,
+        &load_trace(&right)?,
+        strict_ids,
+        max_differences,
+    );
+    if as_json {
+        println!("{}", serde_json::to_string_pretty(&comparison)?);
+    } else {
+        print_trace_diff(&comparison);
+    }
+    Ok(if comparison.equal { 0 } else { 1 })
+}
+
 fn protocol_events(events: Vec<Value>) -> Vec<Value> {
     events
         .into_iter()
@@ -297,6 +398,13 @@ fn run() -> Result<i32> {
     match Cli::parse().command {
         Commands::Record { trace, ui, command } => record(trace, ui, command),
         Commands::Inspect { trace, json } => inspect(trace, json),
+        Commands::Diff {
+            left,
+            right,
+            json,
+            strict_ids,
+            max_differences,
+        } => diff(left, right, json, strict_ids, max_differences),
         Commands::Replay {
             trace,
             speed,

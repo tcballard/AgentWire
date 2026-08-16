@@ -1,0 +1,4 @@
+{"id":1,"method":"initialize","params":{"clientInfo":{"name":"test","version":"0.1"}}}
+{"method":"initialized"}
+{"id":2,"method":"thread/start","params":{"cwd":"."}}
+{"id":3,"method":"turn/start","params":{"threadId":"thread-demo","input":[{"type":"text","text":"hello"}]}}
