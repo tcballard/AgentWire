@@ -1,3 +1,4 @@
 *.jsonl
+!tests/fixtures/*.jsonl
 /target/
 *.profraw

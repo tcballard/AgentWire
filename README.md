@@ -1,11 +1,13 @@
 # AgentWire
 
-**A native protocol tap and deterministic replay server for Codex App Server.**
+**tcpdump + VCR for coding-agent protocols — starting with Codex App Server.**
 
-AgentWire is a Rust binary that sits transparently between a Codex App Server
-client and `codex app-server`. It records both directions of the newline-delimited
-JSON protocol, redacts common credentials, provides a live browser inspector,
-and replays captured server behaviour without another model call.
+[![CI](https://github.com/tcballard/AgentWire/actions/workflows/ci.yml/badge.svg)](https://github.com/tcballard/AgentWire/actions/workflows/ci.yml)
+
+AgentWire is a native Rust protocol tap for developers building coding-agent
+clients. It proxies the exact JSONL bytes between a client and `codex app-server`,
+writes private redacted traces, diffs runs down to the changed payload path, and
+replays recorded server behaviour deterministically—without another model call.
 
 This is an independent community project. It is not affiliated with or endorsed
 by OpenAI.
@@ -35,6 +37,29 @@ agentwire record --trace login-flow.jsonl -- codex app-server
 agentwire inspect login-flow.jsonl
 agentwire serve login-flow.jsonl
 ```
+
+Compare two runs like protocol captures. Request IDs are ignored by default,
+and the two duplex streams are compared independently so thread scheduling does
+not create false differences:
+
+```bash
+agentwire diff before.jsonl after.jsonl
+```
+
+```diff
+traces differ: 1 protocol event(s) differ (11 left, 11 right)
+
+@@ client → server event 4 · changed @@
+- client → server  request  turn/start
++ client → server  request  turn/start
+  /payload/params/input/0/text
+    - "hello"
+    + "goodbye"
+```
+
+`diff` exits `0` for protocol-equivalent traces, `1` for a difference, and `2`
+for an invalid trace or command. Use `--json` in CI and `--strict-ids` when
+transport request IDs are themselves significant.
 
 Replay the trace as a fake App Server:
 
@@ -116,6 +141,8 @@ Redaction is defense in depth, not a guarantee. Review a trace before sharing it
 
 - Codex App Server's JSONL stdio transport only.
 - Replay validates method order, not full application state.
+- Diff compares order within each protocol direction, not scheduler-dependent
+  interleaving between the two directions.
 - Timing is immediate by default; use `--speed 1` for recorded delays.
 - Binary attachments and experimental WebSocket transports are out of scope.
 - The browser inspector polls the trace rather than using a live socket.
