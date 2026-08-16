@@ -1,0 +1,318 @@
+use agentwire::core::{
+    load_trace, method_of, parse_message, remember_request_id, rewrite_response_id, summarize,
+    TraceRecorder,
+};
+use agentwire::web::{serve_forever, WebServer};
+use anyhow::{bail, Context, Result};
+use clap::{Parser, Subcommand};
+use serde_json::Value;
+use std::collections::HashMap;
+use std::ffi::OsString;
+use std::io::{self, BufRead, BufReader, Write};
+use std::path::PathBuf;
+use std::process::{Command, Stdio};
+use std::sync::{mpsc, Arc};
+use std::thread;
+use std::time::Duration;
+
+#[derive(Parser)]
+#[command(
+    name = "agentwire",
+    version,
+    about = "Record and replay Codex App Server JSONL traffic"
+)]
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// Run a child App Server and record both protocol directions.
+    Record {
+        /// Trace output path (default: timestamped JSONL).
+        #[arg(long)]
+        trace: Option<PathBuf>,
+        /// Serve the live inspector, optionally at HOST:PORT.
+        #[arg(long, num_args = 0..=1, default_missing_value = "127.0.0.1:4777")]
+        ui: Option<String>,
+        /// Child command, normally: -- codex app-server
+        #[arg(last = true, required = true)]
+        command: Vec<OsString>,
+    },
+    /// Summarize a recorded trace.
+    Inspect {
+        trace: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Act as a deterministic fake App Server from a trace.
+    Replay {
+        trace: PathBuf,
+        /// Timing multiplier; zero emits immediately.
+        #[arg(long, default_value_t = 0.0)]
+        speed: f64,
+        /// Require exact client payloads.
+        #[arg(long)]
+        strict_payload: bool,
+    },
+    /// Open the trace inspector.
+    Serve {
+        trace: PathBuf,
+        #[arg(long, default_value = "127.0.0.1:4777")]
+        listen: String,
+    },
+    /// Check whether live capture can run.
+    Doctor,
+}
+
+fn default_trace_path() -> PathBuf {
+    PathBuf::from(format!(
+        "agentwire-{}.jsonl",
+        chrono::Utc::now().format("%Y%m%dT%H%M%SZ")
+    ))
+}
+
+fn record(trace: Option<PathBuf>, ui: Option<String>, command: Vec<OsString>) -> Result<i32> {
+    let trace = trace.unwrap_or_else(default_trace_path);
+    let recorder = Arc::new(TraceRecorder::new(&trace, &command)?);
+    let inspector = ui
+        .as_deref()
+        .map(|listen| WebServer::start(trace.clone(), listen))
+        .transpose()?;
+    if let Some(inspector) = inspector.as_ref() {
+        eprintln!("AgentWire inspector: {}", inspector.url());
+    }
+    eprintln!(
+        "AgentWire trace: {}",
+        recorder.path().canonicalize()?.display()
+    );
+
+    let child = Command::new(&command[0])
+        .args(&command[1..])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn();
+    let mut child = match child {
+        Ok(child) => child,
+        Err(error) => {
+            recorder.record_meta(
+                "spawn_error",
+                serde_json::json!({ "error": error.to_string() }),
+            )?;
+            recorder.close(None)?;
+            return Err(error).with_context(|| format!("failed to start {:?}", command[0]));
+        }
+    };
+    let mut child_input = child.stdin.take().context("child stdin unavailable")?;
+    let child_output = child.stdout.take().context("child stdout unavailable")?;
+    let input_recorder = Arc::clone(&recorder);
+    let (input_done_tx, input_done_rx) = mpsc::sync_channel(1);
+    thread::spawn(move || {
+        let stdin = io::stdin();
+        let mut input = stdin.lock();
+        let mut line = Vec::new();
+        loop {
+            line.clear();
+            match input.read_until(b'\n', &mut line) {
+                Ok(0) => break,
+                Ok(_) => {
+                    let _ = input_recorder.record_line("client_to_server", &line);
+                    if child_input
+                        .write_all(&line)
+                        .and_then(|_| child_input.flush())
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        let _ = input_done_tx.send(());
+    });
+
+    let mut output = BufReader::new(child_output);
+    let stdout = io::stdout();
+    let mut client_output = stdout.lock();
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        if output.read_until(b'\n', &mut line)? == 0 {
+            break;
+        }
+        recorder.record_line("server_to_client", &line)?;
+        client_output.write_all(&line)?;
+        client_output.flush()?;
+    }
+    let status = child.wait()?;
+    let _ = input_done_rx.recv_timeout(Duration::from_secs(1));
+    recorder.close(status.code())?;
+    drop(inspector);
+    Ok(status.code().unwrap_or(1))
+}
+
+fn inspect(trace: PathBuf, as_json: bool) -> Result<i32> {
+    let summary = summarize(&load_trace(&trace)?);
+    if as_json {
+        println!("{}", serde_json::to_string_pretty(&summary)?);
+    } else {
+        println!("trace       {}", trace.display());
+        println!("events      {}", summary.events);
+        println!("duration    {:.1} ms", summary.duration_ms);
+        println!("client →    {}", summary.client_messages);
+        println!("server →    {}", summary.server_messages);
+        println!("errors      {}", summary.errors);
+        println!("invalid     {}", summary.invalid_messages);
+        if !summary.methods.is_empty() {
+            println!("methods");
+            for (method, count) in summary.methods {
+                println!("  {count:>4}  {method}");
+            }
+        }
+    }
+    Ok(0)
+}
+
+fn protocol_events(events: Vec<Value>) -> Vec<Value> {
+    events
+        .into_iter()
+        .filter(|event| {
+            matches!(
+                event.get("direction").and_then(Value::as_str),
+                Some("client_to_server" | "server_to_client")
+            )
+        })
+        .collect()
+}
+
+fn emit_server_events(
+    events: &[Value],
+    index: &mut usize,
+    previous_elapsed: &mut f64,
+    speed: f64,
+    id_map: &HashMap<String, Value>,
+) -> Result<()> {
+    let stdout = io::stdout();
+    let mut output = stdout.lock();
+    while *index < events.len()
+        && events[*index].get("direction").and_then(Value::as_str) == Some("server_to_client")
+    {
+        let event = &events[*index];
+        let elapsed = event
+            .get("elapsed_ms")
+            .and_then(Value::as_f64)
+            .unwrap_or(*previous_elapsed);
+        if speed > 0.0 {
+            thread::sleep(Duration::from_secs_f64(
+                ((elapsed - *previous_elapsed).max(0.0) / 1000.0) / speed,
+            ));
+        }
+        *previous_elapsed = elapsed;
+        let payload = rewrite_response_id(event.get("payload").unwrap_or(&Value::Null), id_map);
+        serde_json::to_writer(&mut output, &payload)?;
+        output.write_all(b"\n")?;
+        output.flush()?;
+        *index += 1;
+    }
+    Ok(())
+}
+
+fn replay(trace: PathBuf, speed: f64, strict_payload: bool) -> Result<i32> {
+    if speed < 0.0 {
+        bail!("--speed cannot be negative");
+    }
+    let events = protocol_events(load_trace(&trace)?);
+    let mut index = 0;
+    let mut id_map = HashMap::new();
+    let mut previous_elapsed = 0.0;
+    emit_server_events(&events, &mut index, &mut previous_elapsed, speed, &id_map)?;
+
+    let stdin = io::stdin();
+    for (line_number, line) in stdin.lock().lines().enumerate() {
+        let line = line?;
+        let incoming = parse_message(line.as_bytes())
+            .with_context(|| format!("client line {} is not a JSON object", line_number + 1))?;
+        emit_server_events(&events, &mut index, &mut previous_elapsed, speed, &id_map)?;
+        if index >= events.len() {
+            bail!("client sent more messages than the trace contains");
+        }
+        let recorded = events[index].get("payload").unwrap_or(&Value::Null);
+        let incoming_method = method_of(&incoming);
+        let recorded_method = method_of(recorded);
+        if incoming_method != recorded_method {
+            bail!("expected client method {recorded_method:?}, got {incoming_method:?}");
+        }
+        remember_request_id(recorded, &incoming, &mut id_map);
+        if strict_payload && incoming != *recorded {
+            bail!("payload mismatch for {incoming_method:?}");
+        }
+        previous_elapsed = events[index]
+            .get("elapsed_ms")
+            .and_then(Value::as_f64)
+            .unwrap_or(previous_elapsed);
+        index += 1;
+        emit_server_events(&events, &mut index, &mut previous_elapsed, speed, &id_map)?;
+    }
+
+    let remaining = events[index..]
+        .iter()
+        .filter(|event| event.get("direction").and_then(Value::as_str) == Some("client_to_server"))
+        .count();
+    if remaining > 0 {
+        bail!("client ended with {remaining} recorded messages remaining");
+    }
+    emit_server_events(&events, &mut index, &mut previous_elapsed, speed, &id_map)?;
+    Ok(0)
+}
+
+fn doctor() -> Result<i32> {
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let executable = if cfg!(windows) { "codex.exe" } else { "codex" };
+    let codex = std::env::split_paths(&path)
+        .map(|directory| directory.join(executable))
+        .find(|candidate| candidate.is_file());
+    println!("agentwire    {}", env!("CARGO_PKG_VERSION"));
+    println!("runtime      native Rust binary");
+    let Some(codex) = codex else {
+        println!("codex        not found");
+        println!("status       replay works; live Codex capture is unavailable");
+        return Ok(1);
+    };
+    let output = Command::new(&codex).arg("--version").output()?;
+    let version = String::from_utf8_lossy(if output.stdout.is_empty() {
+        &output.stderr
+    } else {
+        &output.stdout
+    });
+    println!("codex        {}", codex.display());
+    println!("version      {}", version.trim());
+    println!("transport    JSONL over stdio");
+    println!("status       ready");
+    Ok(0)
+}
+
+fn run() -> Result<i32> {
+    match Cli::parse().command {
+        Commands::Record { trace, ui, command } => record(trace, ui, command),
+        Commands::Inspect { trace, json } => inspect(trace, json),
+        Commands::Replay {
+            trace,
+            speed,
+            strict_payload,
+        } => replay(trace, speed, strict_payload),
+        Commands::Serve { trace, listen } => serve_forever(trace, &listen).map(|_| 0),
+        Commands::Doctor => doctor(),
+    }
+}
+
+fn main() {
+    match run() {
+        Ok(code) => std::process::exit(code),
+        Err(error) => {
+            eprintln!("agentwire: {error:#}");
+            std::process::exit(2);
+        }
+    }
+}
