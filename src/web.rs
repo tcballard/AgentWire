@@ -38,9 +38,19 @@ fn response(status: &str, content_type: &str, body: &[u8], no_store: bool) -> Ve
 
 fn handle(mut stream: TcpStream, trace: &Path) -> Result<()> {
     stream.set_read_timeout(Some(Duration::from_secs(2)))?;
-    let mut request = [0_u8; 8192];
-    let length = stream.read(&mut request)?;
-    let first_line = String::from_utf8_lossy(&request[..length]);
+    let mut request = Vec::with_capacity(1024);
+    let mut chunk = [0_u8; 1024];
+    while request.len() < 8192 {
+        let length = stream.read(&mut chunk)?;
+        if length == 0 {
+            break;
+        }
+        request.extend_from_slice(&chunk[..length]);
+        if request.windows(4).any(|window| window == b"\r\n\r\n") {
+            break;
+        }
+    }
+    let first_line = String::from_utf8_lossy(&request);
     let path = first_line
         .lines()
         .next()
@@ -144,7 +154,8 @@ mod tests {
 
     fn get(address: SocketAddr, path: &str) -> String {
         let mut stream = TcpStream::connect(address).unwrap();
-        write!(stream, "GET {path} HTTP/1.1\r\nHost: localhost\r\n\r\n").unwrap();
+        let request = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\n\r\n");
+        stream.write_all(request.as_bytes()).unwrap();
         let mut response = String::new();
         stream.read_to_string(&mut response).unwrap();
         response
