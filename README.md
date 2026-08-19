@@ -15,7 +15,15 @@ by OpenAI.
 ## Install
 
 ```bash
-cargo install --git https://github.com/tcballard/AgentWire
+cargo install --locked agentwire
+```
+
+Prebuilt binaries for Linux, macOS, and Windows are attached to each
+[GitHub release](https://github.com/tcballard/AgentWire/releases). To build
+the latest development version instead:
+
+```bash
+cargo install --locked --git https://github.com/tcballard/AgentWire
 ```
 
 ## Quick start
@@ -111,6 +119,40 @@ target/debug/agentwire inspect demo.jsonl
 target/debug/agentwire serve demo.jsonl
 target/debug/agentwire replay demo.jsonl
 ```
+
+## Fixture-driven client tests
+
+Record a session once, commit the trace, and run your client's test suite
+against the recording — deterministic server behaviour on every run, with
+no Codex install, no API key, and no model spend in CI.
+
+Record the fixture from a real session:
+
+```bash
+agentwire record --trace tests/fixtures/login-flow.jsonl -- codex app-server
+```
+
+Then have the test suite launch AgentWire in place of `codex app-server`:
+
+```bash
+agentwire replay tests/fixtures/login-flow.jsonl
+```
+
+Replay checks that the client sends the recorded methods in the recorded
+order and exits non-zero on drift, so the fixture doubles as a protocol
+assertion; add `--strict-payload` to require byte-identical requests. Pair
+it with `diff` to catch behavioural drift between client versions or Codex
+releases:
+
+```bash
+agentwire record --trace current.jsonl -- codex app-server < scripted-session.jsonl
+agentwire diff --json tests/fixtures/login-flow.jsonl current.jsonl
+```
+
+`diff` exits `0` for protocol-equivalent traces and `1` on any difference,
+so both commands drop straight into a CI gate. Traces are redacted on
+write, but review a fixture before committing it to a shared repository
+(see [Security boundary](#security-boundary)).
 
 ## Trace format
 
