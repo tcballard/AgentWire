@@ -30,6 +30,11 @@ name = "agentwire-mock-server"
 path = "tests/support/mock_app_server.rs"
 required-features = ["test-support"]
 
+[[bin]]
+name = "agentwire-mock-acp-agent"
+path = "tests/support/mock_acp_agent.rs"
+required-features = ["test-support"]
+
 [profile.release]
 lto = true
 codegen-units = 1

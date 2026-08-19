@@ -1,12 +1,14 @@
 use serde_json::Value;
 use std::io::{BufRead, BufReader, Write};
-use std::process::{Command, Output, Stdio};
+use std::path::Path;
+use std::process::{Child, ChildStdin, Command, Output, Stdio};
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use std::time::Duration;
 
 const CLIENT_INPUT: &str = include_str!("fixtures/client.jsonl");
 const CHANGED_CLIENT_INPUT: &str = include_str!("fixtures/client-changed.jsonl");
+const ACP_CLIENT_INPUT: &str = include_str!("fixtures/acp-client.jsonl");
 
 fn run_with_input(command: &mut Command, input: &str) -> Output {
     let mut child = command
@@ -24,26 +26,85 @@ fn run_with_input(command: &mut Command, input: &str) -> Output {
     child.wait_with_output().unwrap()
 }
 
-#[test]
-fn record_inspect_and_replay_round_trip() {
-    let directory = tempfile::tempdir().unwrap();
-    let trace = directory.path().join("round-trip.jsonl");
-    let agentwire = env!("CARGO_BIN_EXE_agentwire");
-    let mock = env!("CARGO_BIN_EXE_agentwire-mock-server");
-
+/// Record `input` against a mock server, pipelining every client message up
+/// front, so most client events land in the trace before the server output
+/// they causally follow.
+fn record_trace(mock: &str, input: &str, trace: &Path) -> Output {
     let record = run_with_input(
-        Command::new(agentwire)
+        Command::new(env!("CARGO_BIN_EXE_agentwire"))
             .arg("record")
             .arg("--trace")
-            .arg(&trace)
+            .arg(trace)
             .arg("--")
             .arg(mock),
-        CLIENT_INPUT,
+        input,
     );
     assert!(
         record.status.success(),
         "{}",
         String::from_utf8_lossy(&record.stderr)
+    );
+    record
+}
+
+struct InteractiveReplay {
+    child: Child,
+    input: ChildStdin,
+    receiver: Receiver<String>,
+}
+
+/// Drive replay as an interactive client: send one message at a time and
+/// block on the matching output before continuing.
+fn spawn_interactive_replay(trace: &Path) -> InteractiveReplay {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_agentwire"))
+        .arg("replay")
+        .arg(trace)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let input = child.stdin.take().unwrap();
+    let output = BufReader::new(child.stdout.take().unwrap());
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        for line in output.lines() {
+            let Ok(line) = line else { break };
+            if sender.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    InteractiveReplay {
+        child,
+        input,
+        receiver,
+    }
+}
+
+fn receive(receiver: &Receiver<String>) -> Value {
+    let line = receiver
+        .recv_timeout(Duration::from_secs(10))
+        .expect("replay stalled instead of emitting the next server message");
+    serde_json::from_str(&line).unwrap()
+}
+
+fn send(input: &mut ChildStdin, message: &str) {
+    input.write_all(message.as_bytes()).unwrap();
+    input.write_all(b"\n").unwrap();
+    input.flush().unwrap();
+}
+
+#[test]
+fn record_inspect_and_replay_round_trip() {
+    let directory = tempfile::tempdir().unwrap();
+    let trace = directory.path().join("round-trip.jsonl");
+    let agentwire = env!("CARGO_BIN_EXE_agentwire");
+
+    let record = record_trace(
+        env!("CARGO_BIN_EXE_agentwire-mock-server"),
+        CLIENT_INPUT,
+        &trace,
     );
     assert!(String::from_utf8_lossy(&record.stdout).contains("turn/completed"));
 
@@ -78,82 +139,124 @@ fn record_inspect_and_replay_round_trip() {
 fn replay_serves_interactive_client_from_pipelined_recording() {
     let directory = tempfile::tempdir().unwrap();
     let trace = directory.path().join("pipelined.jsonl");
-    let agentwire = env!("CARGO_BIN_EXE_agentwire");
-    let mock = env!("CARGO_BIN_EXE_agentwire-mock-server");
-
-    // The fixture pipelines every client message up front, so most client
-    // events are recorded before the server output they causally follow.
-    let record = run_with_input(
-        Command::new(agentwire)
-            .arg("record")
-            .arg("--trace")
-            .arg(&trace)
-            .arg("--")
-            .arg(mock),
+    record_trace(
+        env!("CARGO_BIN_EXE_agentwire-mock-server"),
         CLIENT_INPUT,
-    );
-    assert!(
-        record.status.success(),
-        "{}",
-        String::from_utf8_lossy(&record.stderr)
+        &trace,
     );
 
-    // Drive replay as an interactive client: send one message, then block on
-    // the matching response before continuing, using fresh request IDs.
-    let mut replay = Command::new(agentwire)
-        .arg("replay")
-        .arg(&trace)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    let mut input = replay.stdin.take().unwrap();
-    let output = BufReader::new(replay.stdout.take().unwrap());
-    let (sender, receiver) = mpsc::channel();
-    thread::spawn(move || {
-        for line in output.lines() {
-            let Ok(line) = line else { break };
-            if sender.send(line).is_err() {
-                break;
-            }
-        }
-    });
-    let receive = |receiver: &Receiver<String>| -> Value {
-        let line = receiver
-            .recv_timeout(Duration::from_secs(10))
-            .expect("replay stalled instead of emitting the next server message");
-        serde_json::from_str(&line).unwrap()
-    };
-    let send = |input: &mut std::process::ChildStdin, message: &str| {
-        input.write_all(message.as_bytes()).unwrap();
-        input.write_all(b"\n").unwrap();
-        input.flush().unwrap();
-    };
-
+    let mut session = spawn_interactive_replay(&trace);
     send(
-        &mut input,
+        &mut session.input,
         r#"{"id":"live-1","method":"initialize","params":{}}"#,
     );
-    assert_eq!(receive(&receiver)["id"], "live-1");
-    send(&mut input, r#"{"method":"initialized"}"#);
+    assert_eq!(receive(&session.receiver)["id"], "live-1");
+    send(&mut session.input, r#"{"method":"initialized"}"#);
     send(
-        &mut input,
+        &mut session.input,
         r#"{"id":"live-2","method":"thread/start","params":{}}"#,
     );
-    assert_eq!(receive(&receiver)["id"], "live-2");
-    assert_eq!(receive(&receiver)["method"], "thread/started");
+    assert_eq!(receive(&session.receiver)["id"], "live-2");
+    assert_eq!(receive(&session.receiver)["method"], "thread/started");
     send(
-        &mut input,
+        &mut session.input,
         r#"{"id":"live-3","method":"turn/start","params":{}}"#,
     );
-    assert_eq!(receive(&receiver)["id"], "live-3");
-    assert_eq!(receive(&receiver)["method"], "turn/started");
-    assert_eq!(receive(&receiver)["method"], "item/agentMessage/delta");
-    assert_eq!(receive(&receiver)["method"], "turn/completed");
-    drop(input);
-    let status = replay.wait().unwrap();
-    assert!(status.success());
+    assert_eq!(receive(&session.receiver)["id"], "live-3");
+    assert_eq!(receive(&session.receiver)["method"], "turn/started");
+    assert_eq!(
+        receive(&session.receiver)["method"],
+        "item/agentMessage/delta"
+    );
+    assert_eq!(receive(&session.receiver)["method"], "turn/completed");
+    drop(session.input);
+    assert!(session.child.wait().unwrap().success());
+}
+
+#[test]
+fn acp_record_inspect_and_replay_round_trip() {
+    let directory = tempfile::tempdir().unwrap();
+    let trace = directory.path().join("acp.jsonl");
+    let agentwire = env!("CARGO_BIN_EXE_agentwire");
+
+    let record = record_trace(
+        env!("CARGO_BIN_EXE_agentwire-mock-acp-agent"),
+        ACP_CLIENT_INPUT,
+        &trace,
+    );
+    assert!(String::from_utf8_lossy(&record.stdout).contains("end_turn"));
+
+    let inspect = Command::new(agentwire)
+        .arg("inspect")
+        .arg(&trace)
+        .arg("--json")
+        .output()
+        .unwrap();
+    assert!(
+        inspect.status.success(),
+        "{}",
+        String::from_utf8_lossy(&inspect.stderr)
+    );
+    let summary: Value = serde_json::from_slice(&inspect.stdout).unwrap();
+    assert_eq!(summary["client_messages"], 4);
+    assert_eq!(summary["server_messages"], 6);
+    assert_eq!(summary["methods"]["session/request_permission"], 1);
+
+    let replay = run_with_input(
+        Command::new(agentwire).arg("replay").arg(&trace),
+        ACP_CLIENT_INPUT,
+    );
+    assert!(
+        replay.status.success(),
+        "{}",
+        String::from_utf8_lossy(&replay.stderr)
+    );
+    assert_eq!(replay.stdout, record.stdout);
+}
+
+#[test]
+fn acp_replay_forwards_permission_request_to_interactive_client() {
+    let directory = tempfile::tempdir().unwrap();
+    let trace = directory.path().join("acp-pipelined.jsonl");
+    record_trace(
+        env!("CARGO_BIN_EXE_agentwire-mock-acp-agent"),
+        ACP_CLIENT_INPUT,
+        &trace,
+    );
+
+    let mut session = spawn_interactive_replay(&trace);
+    send(
+        &mut session.input,
+        r#"{"jsonrpc":"2.0","id":"live-1","method":"initialize","params":{"protocolVersion":1}}"#,
+    );
+    let response = receive(&session.receiver);
+    assert_eq!(response["id"], "live-1");
+    assert_eq!(response["result"]["protocolVersion"], 1);
+    send(
+        &mut session.input,
+        r#"{"jsonrpc":"2.0","id":"live-2","method":"session/new","params":{"cwd":"/workspace","mcpServers":[]}}"#,
+    );
+    assert_eq!(receive(&session.receiver)["id"], "live-2");
+    assert_eq!(receive(&session.receiver)["method"], "session/update");
+    // The agent-initiated request arrives with its recorded ID, and the
+    // output that followed it stays held until the client answers.
+    let permission = receive(&session.receiver);
+    assert_eq!(permission["method"], "session/request_permission");
+    assert_eq!(permission["id"], "perm-1");
+    send(
+        &mut session.input,
+        r#"{"jsonrpc":"2.0","id":"live-3","method":"session/prompt","params":{"sessionId":"sess-demo","prompt":[{"type":"text","text":"update the config"}]}}"#,
+    );
+    send(
+        &mut session.input,
+        r#"{"jsonrpc":"2.0","id":"perm-1","result":{"outcome":{"outcome":"selected","optionId":"allow"}}}"#,
+    );
+    assert_eq!(receive(&session.receiver)["method"], "session/update");
+    let done = receive(&session.receiver);
+    assert_eq!(done["id"], "live-3");
+    assert_eq!(done["result"]["stopReason"], "end_turn");
+    drop(session.input);
+    assert!(session.child.wait().unwrap().success());
 }
 
 #[test]
@@ -165,20 +268,7 @@ fn diff_identifies_protocol_payload_regression() {
     let mock = env!("CARGO_BIN_EXE_agentwire-mock-server");
 
     for (trace, input) in [(&left, CLIENT_INPUT), (&right, CHANGED_CLIENT_INPUT)] {
-        let record = run_with_input(
-            Command::new(agentwire)
-                .arg("record")
-                .arg("--trace")
-                .arg(trace)
-                .arg("--")
-                .arg(mock),
-            input,
-        );
-        assert!(
-            record.status.success(),
-            "{}",
-            String::from_utf8_lossy(&record.stderr)
-        );
+        record_trace(mock, input, trace);
     }
 
     let equal = Command::new(agentwire)
