@@ -316,7 +316,7 @@ pub fn request_id_of(payload: &Value) -> Option<&Value> {
     payload.as_object()?.get("id")
 }
 
-fn id_key(value: &Value) -> String {
+pub(crate) fn id_key(value: &Value) -> String {
     serde_json::to_string(value).expect("JSON value must serialize")
 }
 

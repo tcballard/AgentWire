@@ -71,6 +71,13 @@ AgentWire validates the sequence of client methods, rewrites recorded response
 IDs to those used by the current client, and emits captured server messages
 deterministically.
 
+Replay does not trust the recorded interleaving between the two streams, which
+depends on thread scheduling. Server messages are emitted in recorded server
+order, but each response waits until the live client has sent the matching
+request, and notifications wait with the response recorded before them. A
+trace recorded from a pipelining client therefore replays correctly against an
+interactive client that blocks on each response, and vice versa.
+
 ## Try it without Codex
 
 Build the binary and opt-in test server:
@@ -142,7 +149,9 @@ Redaction is defense in depth, not a guarantee. Review a trace before sharing it
 ## Current limits
 
 - Codex App Server's JSONL stdio transport only.
-- Replay validates method order, not full application state.
+- Replay validates client method order and response causality, not full
+  application state. It assumes a client's next message depends only on
+  responses to its own requests, not on the timing of unrelated notifications.
 - Diff compares order within each protocol direction, not scheduler-dependent
   interleaving between the two directions.
 - Timing is immediate by default; use `--speed 1` for recorded delays.
