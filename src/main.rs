@@ -3,6 +3,7 @@ use agentwire::core::{
     TraceRecorder,
 };
 use agentwire::diff::{compare_traces, ComparableEvent, TraceDiff};
+use agentwire::replay::plan_replay;
 use agentwire::web::{serve_forever, WebServer};
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
@@ -276,95 +277,64 @@ fn diff(
     Ok(if comparison.equal { 0 } else { 1 })
 }
 
-fn protocol_events(events: Vec<Value>) -> Vec<Value> {
-    events
-        .into_iter()
-        .filter(|event| {
-            matches!(
-                event.get("direction").and_then(Value::as_str),
-                Some("client_to_server" | "server_to_client")
-            )
-        })
-        .collect()
-}
-
-fn emit_server_events(
-    events: &[Value],
-    index: &mut usize,
-    previous_elapsed: &mut f64,
-    speed: f64,
-    id_map: &HashMap<String, Value>,
-) -> Result<()> {
-    let stdout = io::stdout();
-    let mut output = stdout.lock();
-    while *index < events.len()
-        && events[*index].get("direction").and_then(Value::as_str) == Some("server_to_client")
-    {
-        let event = &events[*index];
-        let elapsed = event
-            .get("elapsed_ms")
-            .and_then(Value::as_f64)
-            .unwrap_or(*previous_elapsed);
-        if speed > 0.0 {
-            thread::sleep(Duration::from_secs_f64(
-                ((elapsed - *previous_elapsed).max(0.0) / 1000.0) / speed,
-            ));
-        }
-        *previous_elapsed = elapsed;
-        let payload = rewrite_response_id(event.get("payload").unwrap_or(&Value::Null), id_map);
-        serde_json::to_writer(&mut output, &payload)?;
-        output.write_all(b"\n")?;
-        output.flush()?;
-        *index += 1;
-    }
-    Ok(())
-}
-
 fn replay(trace: PathBuf, speed: f64, strict_payload: bool) -> Result<i32> {
     if speed < 0.0 {
         bail!("--speed cannot be negative");
     }
-    let events = protocol_events(load_trace(&trace)?);
-    let mut index = 0;
+    let plan = plan_replay(&load_trace(&trace)?);
+    let stdout = io::stdout();
+    let mut output = stdout.lock();
     let mut id_map = HashMap::new();
-    let mut previous_elapsed = 0.0;
-    emit_server_events(&events, &mut index, &mut previous_elapsed, speed, &id_map)?;
+    let mut received = 0;
+    let mut emitted = 0;
+    let mut previous_elapsed: f64 = 0.0;
 
     let stdin = io::stdin();
-    for (line_number, line) in stdin.lock().lines().enumerate() {
-        let line = line?;
-        let incoming = parse_message(line.as_bytes())
-            .with_context(|| format!("client line {} is not a JSON object", line_number + 1))?;
-        emit_server_events(&events, &mut index, &mut previous_elapsed, speed, &id_map)?;
-        if index >= events.len() {
-            bail!("client sent more messages than the trace contains");
+    let mut lines = stdin.lock().lines();
+    loop {
+        while emitted < plan.server.len() && plan.server[emitted].gate <= received {
+            let step = &plan.server[emitted];
+            if speed > 0.0 {
+                thread::sleep(Duration::from_secs_f64(
+                    ((step.elapsed_ms - previous_elapsed).max(0.0) / 1000.0) / speed,
+                ));
+            }
+            previous_elapsed = previous_elapsed.max(step.elapsed_ms);
+            let payload = rewrite_response_id(&step.payload, &id_map);
+            serde_json::to_writer(&mut output, &payload)?;
+            output.write_all(b"\n")?;
+            output.flush()?;
+            emitted += 1;
         }
-        let recorded = events[index].get("payload").unwrap_or(&Value::Null);
+        if received == plan.client.len() {
+            break;
+        }
+        let Some(line) = lines.next() else {
+            bail!(
+                "client ended with {} recorded messages remaining",
+                plan.client.len() - received
+            );
+        };
+        let incoming = parse_message(line?.as_bytes())
+            .with_context(|| format!("client line {} is not a JSON object", received + 1))?;
+        let expected = &plan.client[received];
         let incoming_method = method_of(&incoming);
-        let recorded_method = method_of(recorded);
-        if incoming_method != recorded_method {
-            bail!("expected client method {recorded_method:?}, got {incoming_method:?}");
+        if incoming_method != expected.method.as_deref() {
+            bail!(
+                "expected client method {:?}, got {incoming_method:?}",
+                expected.method.as_deref()
+            );
         }
-        remember_request_id(recorded, &incoming, &mut id_map);
-        if strict_payload && incoming != *recorded {
+        remember_request_id(&expected.payload, &incoming, &mut id_map);
+        if strict_payload && incoming != expected.payload {
             bail!("payload mismatch for {incoming_method:?}");
         }
-        previous_elapsed = events[index]
-            .get("elapsed_ms")
-            .and_then(Value::as_f64)
-            .unwrap_or(previous_elapsed);
-        index += 1;
-        emit_server_events(&events, &mut index, &mut previous_elapsed, speed, &id_map)?;
+        previous_elapsed = previous_elapsed.max(expected.elapsed_ms);
+        received += 1;
     }
-
-    let remaining = events[index..]
-        .iter()
-        .filter(|event| event.get("direction").and_then(Value::as_str) == Some("client_to_server"))
-        .count();
-    if remaining > 0 {
-        bail!("client ended with {remaining} recorded messages remaining");
+    if lines.next().transpose()?.is_some() {
+        bail!("client sent more messages than the trace contains");
     }
-    emit_server_events(&events, &mut index, &mut previous_elapsed, speed, &id_map)?;
     Ok(0)
 }
 
