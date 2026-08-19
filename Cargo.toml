@@ -3,12 +3,12 @@ name = "agentwire"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.80"
-description = "Native record, diff, and deterministic replay for Codex App Server"
+description = "Record, diff, and deterministic replay for coding-agent protocols (Codex App Server, ACP)"
 license = "MIT"
 repository = "https://github.com/tcballard/AgentWire"
 readme = "README.md"
 exclude = [".github/"]
-keywords = ["codex", "json-rpc", "debugging", "replay", "developer-tools"]
+keywords = ["codex", "acp", "json-rpc", "debugging", "replay"]
 categories = ["command-line-utilities", "development-tools::debugging"]
 
 [dependencies]
