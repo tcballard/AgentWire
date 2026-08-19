@@ -10,13 +10,15 @@
 //!   request;
 //! - a server notification (or server-initiated request) waits with the last
 //!   gated server message recorded before it;
-//! - a client reply to a server-initiated request also gates later server
-//!   output, because the recorded client could only answer a request the
-//!   server had already sent.
+//! - a client reply to a server-initiated request gates the server output
+//!   recorded after that request, because in the live session those messages
+//!   could only follow the reply. A pipelining client can record its reply
+//!   before the request it answers, so the reply's gate is deferred until
+//!   the request appears in the server stream.
 
 use crate::core::{classify_message, id_key, request_id_of};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ClientStep {
@@ -42,6 +44,8 @@ pub struct ReplayPlan {
 pub fn plan_replay(events: &[Value]) -> ReplayPlan {
     let mut plan = ReplayPlan::default();
     let mut request_positions: HashMap<String, usize> = HashMap::new();
+    let mut deferred_reply_gates: HashMap<String, usize> = HashMap::new();
+    let mut server_requests_seen: HashSet<String> = HashSet::new();
     let mut pending_gate = 0;
     let mut elapsed = 0.0;
     for event in events {
@@ -54,12 +58,26 @@ pub fn plan_replay(events: &[Value]) -> ReplayPlan {
         match event.get("direction").and_then(Value::as_str) {
             Some("client_to_server") => {
                 let position = plan.client.len();
-                if kind == "request" {
-                    if let Some(id) = request_id_of(&payload) {
-                        request_positions.insert(id_key(id), position);
+                match kind {
+                    "request" => {
+                        if let Some(id) = request_id_of(&payload) {
+                            request_positions.insert(id_key(id), position);
+                        }
                     }
-                } else if kind == "response" {
-                    pending_gate = pending_gate.max(position + 1);
+                    "response" => {
+                        // A pipelining client records its reply before the
+                        // server request it answers; the reply only gates
+                        // server output once that request has been emitted.
+                        if let Some(id) = request_id_of(&payload) {
+                            let key = id_key(id);
+                            if server_requests_seen.contains(&key) {
+                                pending_gate = pending_gate.max(position + 1);
+                            } else {
+                                deferred_reply_gates.insert(key, position + 1);
+                            }
+                        }
+                    }
+                    _ => {}
                 }
                 plan.client.push(ClientStep {
                     method: method.map(str::to_owned),
@@ -77,6 +95,17 @@ pub fn plan_replay(events: &[Value]) -> ReplayPlan {
                     }
                 }
                 pending_gate = gate;
+                if kind == "request" {
+                    if let Some(id) = request_id_of(&payload) {
+                        let key = id_key(id);
+                        server_requests_seen.insert(key.clone());
+                        // The request itself keeps its own gate; only output
+                        // recorded after it waits for the client's reply.
+                        if let Some(reply_gate) = deferred_reply_gates.remove(&key) {
+                            pending_gate = pending_gate.max(reply_gate);
+                        }
+                    }
+                }
                 plan.server.push(ServerStep {
                     payload,
                     elapsed_ms: elapsed,
@@ -180,5 +209,39 @@ mod tests {
         // turn/completed was only observed after the approval reply, so it
         // must wait for both client messages.
         assert_eq!(gates, vec![1, 1, 2]);
+    }
+
+    #[test]
+    fn pipelined_reply_gates_only_after_its_request_appears() {
+        // The client pipelined everything, including its reply to the
+        // server's permission request, so the reply is recorded before the
+        // request it answers. The reply must not gate the earlier server
+        // output — least of all the permission request itself — but the
+        // output recorded after that request still waits for it.
+        let events = vec![
+            event(
+                "client_to_server",
+                json!({ "id": 1, "method": "initialize" }),
+            ),
+            event(
+                "client_to_server",
+                json!({ "id": 2, "method": "session/prompt" }),
+            ),
+            event(
+                "client_to_server",
+                json!({ "id": "perm-1", "result": { "outcome": "allow" } }),
+            ),
+            event("server_to_client", json!({ "id": 1, "result": {} })),
+            event("server_to_client", json!({ "method": "session/update" })),
+            event(
+                "server_to_client",
+                json!({ "id": "perm-1", "method": "session/request_permission" }),
+            ),
+            event("server_to_client", json!({ "method": "session/update" })),
+            event("server_to_client", json!({ "id": 2, "result": {} })),
+        ];
+        let plan = plan_replay(&events);
+        let gates: Vec<usize> = plan.server.iter().map(|step| step.gate).collect();
+        assert_eq!(gates, vec![1, 1, 1, 3, 3]);
     }
 }

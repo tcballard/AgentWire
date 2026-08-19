@@ -1,16 +1,18 @@
 # AgentWire
 
-**tcpdump + VCR for coding-agent protocols — starting with Codex App Server.**
+**tcpdump + VCR for coding-agent protocols — Codex App Server and ACP.**
 
 [![CI](https://github.com/tcballard/AgentWire/actions/workflows/ci.yml/badge.svg)](https://github.com/tcballard/AgentWire/actions/workflows/ci.yml)
 
 AgentWire is a native Rust protocol tap for developers building coding-agent
-clients. It proxies the exact JSONL bytes between a client and `codex app-server`,
-writes private redacted traces, diffs runs down to the changed payload path, and
-replays recorded server behaviour deterministically—without another model call.
+clients. It proxies the exact JSONL bytes between a client and a coding-agent
+process — `codex app-server` or any [ACP](https://agentclientprotocol.com)
+agent — writes private redacted traces, diffs runs down to the changed payload
+path, and replays recorded server behaviour deterministically—without another
+model call.
 
 This is an independent community project. It is not affiliated with or endorsed
-by OpenAI.
+by OpenAI or Zed Industries.
 
 ## Install
 
@@ -154,6 +156,28 @@ so both commands drop straight into a CI gate. Traces are redacted on
 write, but review a fixture before committing it to a shared repository
 (see [Security boundary](#security-boundary)).
 
+## ACP agents
+
+Nothing in the tap is specific to Codex: record, inspect, diff, and replay
+operate on newline-delimited JSON-RPC over stdio, which is also the
+transport of the [Agent Client Protocol](https://agentclientprotocol.com)
+used by Zed and a growing set of agents. Wrap the agent command your editor
+launches:
+
+```bash
+agentwire record --trace acp-session.jsonl -- some-acp-agent
+```
+
+The ACP agent is the server side of the trace. Agent-initiated requests
+such as `session/request_permission` record, diff, and replay like any
+other message: on replay, AgentWire emits the recorded request and holds
+the output that followed it until the live client answers.
+
+The test-support build also produces `agentwire-mock-acp-agent`, a mock
+ACP agent with a permission round trip, driven by
+`tests/fixtures/acp-client.jsonl` the same way as the App Server mock
+above.
+
 ## Trace format
 
 Trace format version 1 is unchanged from the prototype. Each line is an
@@ -190,7 +214,9 @@ Redaction is defense in depth, not a guarantee. Review a trace before sharing it
 
 ## Current limits
 
-- Codex App Server's JSONL stdio transport only.
+- Newline-delimited JSON-RPC over stdio only. Codex App Server and ACP are
+  covered by tests; other agents using the same framing should work
+  unchanged.
 - Replay validates client method order and response causality, not full
   application state. It assumes a client's next message depends only on
   responses to its own requests, not on the timing of unrelated notifications.
