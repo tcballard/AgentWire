@@ -128,7 +128,9 @@ independently readable event:
 ## Security boundary
 
 - Trace files use owner-only permissions (`0600`) on Unix.
-- Token, password, secret, cookie, credential, and API-key fields are redacted.
+- Fields whose names end in token, secret, password, passphrase, cookie,
+  credential, authorization, API key, or private key are redacted —
+  `client_secret`, `refresh_token`, and `sshPrivateKey` all match.
 - Bearer tokens, OpenAI-style keys, and secret environment assignments are
   redacted inside strings.
 - Original protocol bytes are forwarded in memory but are not retained.

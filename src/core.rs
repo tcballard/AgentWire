@@ -41,22 +41,32 @@ fn normalized_key(key: &str) -> String {
         .collect()
 }
 
+/// Compared against the end of the normalized key so that prefixed variants
+/// (`client_secret`, `refresh_token`, `sshPrivateKey`, `X-Api-Key`) match.
+/// Bare `key` and plural `tokens` are deliberately absent: they would swallow
+/// structural fields such as `cacheKey`, `sortKey`, and LLM usage counters
+/// like `inputTokens`.
+const SENSITIVE_KEY_SUFFIXES: &[&str] = &[
+    "apikey",
+    "apikeys",
+    "authorization",
+    "cookie",
+    "cookies",
+    "credential",
+    "credentials",
+    "passphrase",
+    "password",
+    "privatekey",
+    "secret",
+    "secrets",
+    "token",
+];
+
 fn sensitive_key(key: &str) -> bool {
-    matches!(
-        normalized_key(key).as_str(),
-        "accesstoken"
-            | "apikey"
-            | "authorization"
-            | "cookie"
-            | "cookies"
-            | "credential"
-            | "credentials"
-            | "password"
-            | "refreshtoken"
-            | "secret"
-            | "sessiontoken"
-            | "token"
-    )
+    let normalized = normalized_key(key);
+    SENSITIVE_KEY_SUFFIXES
+        .iter()
+        .any(|suffix| normalized.ends_with(suffix))
 }
 
 pub fn redact_string(value: &str) -> String {
@@ -409,6 +419,31 @@ mod tests {
             redacted["command"],
             format!("OPENAI_API_KEY={REDACTED} run")
         );
+    }
+
+    #[test]
+    fn redacts_keys_by_suffix_without_swallowing_structural_fields() {
+        let value = json!({
+            "client_secret": "oauth-secret",
+            "id_token": "eyJhbGciOi.payload.signature",
+            "sshPrivateKey": "-----BEGIN OPENSSH PRIVATE KEY-----",
+            "X-Api-Key": "service-key",
+            "secrets": { "DEPLOY_KEY": "value" },
+            "max_tokens": 4096,
+            "input_tokens": 128,
+            "cacheKey": "thread-42",
+            "text": "hello"
+        });
+        let redacted = redact(&value);
+        assert_eq!(redacted["client_secret"], REDACTED);
+        assert_eq!(redacted["id_token"], REDACTED);
+        assert_eq!(redacted["sshPrivateKey"], REDACTED);
+        assert_eq!(redacted["X-Api-Key"], REDACTED);
+        assert_eq!(redacted["secrets"], REDACTED);
+        assert_eq!(redacted["max_tokens"], 4096);
+        assert_eq!(redacted["input_tokens"], 128);
+        assert_eq!(redacted["cacheKey"], "thread-42");
+        assert_eq!(redacted["text"], "hello");
     }
 
     #[test]
