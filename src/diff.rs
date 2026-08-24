@@ -2,6 +2,94 @@ use serde::Serialize;
 use serde_json::Value;
 use std::collections::BTreeSet;
 
+pub const IGNORED: &str = "[ignored]";
+
+/// A user-supplied rule marking payload values that legitimately vary
+/// between runs (generated thread IDs, timestamps) so they compare equal.
+#[derive(Clone, Debug)]
+pub struct IgnoreRule {
+    source: String,
+    matcher: Matcher,
+}
+
+#[derive(Clone, Debug)]
+enum Matcher {
+    /// Bare key name: matches an object member with this key at any depth.
+    Key(String),
+    /// JSON pointer segments as printed in diff output (starting with
+    /// /payload); a `*` segment matches any single key or array index.
+    Path(Vec<String>),
+}
+
+impl IgnoreRule {
+    pub fn parse(rule: &str) -> Result<IgnoreRule, String> {
+        if rule.is_empty() {
+            return Err("ignore rule cannot be empty".into());
+        }
+        let matcher = if let Some(pointer) = rule.strip_prefix('/') {
+            let segments: Vec<String> = pointer
+                .split('/')
+                .map(|segment| segment.replace("~1", "/").replace("~0", "~"))
+                .collect();
+            if segments.iter().any(String::is_empty) {
+                return Err(format!("ignore path {rule} has an empty segment"));
+            }
+            Matcher::Path(segments)
+        } else {
+            Matcher::Key(rule.to_owned())
+        };
+        Ok(IgnoreRule {
+            source: rule.to_owned(),
+            matcher,
+        })
+    }
+
+    pub fn source(&self) -> &str {
+        &self.source
+    }
+
+    fn matches(&self, key: Option<&str>, path: &[String]) -> bool {
+        match &self.matcher {
+            Matcher::Key(name) => key == Some(name.as_str()),
+            Matcher::Path(segments) => {
+                segments.len() == path.len()
+                    && segments
+                        .iter()
+                        .zip(path)
+                        .all(|(segment, part)| segment == "*" || segment == part)
+            }
+        }
+    }
+}
+
+fn apply_ignores_at(value: &mut Value, path: &mut Vec<String>, rules: &[IgnoreRule]) {
+    match value {
+        Value::Object(object) => {
+            for (key, child) in object.iter_mut() {
+                path.push(key.clone());
+                if rules.iter().any(|rule| rule.matches(Some(key), path)) {
+                    *child = Value::String(IGNORED.into());
+                } else {
+                    apply_ignores_at(child, path, rules);
+                }
+                path.pop();
+            }
+        }
+        Value::Array(items) => {
+            for (index, child) in items.iter_mut().enumerate() {
+                path.push(index.to_string());
+                if rules.iter().any(|rule| rule.matches(None, path)) {
+                    *child = Value::String(IGNORED.into());
+                } else {
+                    apply_ignores_at(child, path, rules);
+                }
+                path.pop();
+            }
+        }
+        _ => {}
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct ComparableEvent {
     pub direction: String,
@@ -34,11 +122,16 @@ pub struct TraceDiff {
     pub right_events: usize,
     pub differences_found: usize,
     pub ignored_request_ids: bool,
+    pub ignored: Vec<String>,
     pub truncated: bool,
     pub differences: Vec<EventDifference>,
 }
 
-fn protocol_events(events: &[Value], strict_ids: bool) -> Vec<ComparableEvent> {
+fn protocol_events(
+    events: &[Value],
+    strict_ids: bool,
+    ignores: &[IgnoreRule],
+) -> Vec<ComparableEvent> {
     events
         .iter()
         .filter_map(|event| {
@@ -51,6 +144,10 @@ fn protocol_events(events: &[Value], strict_ids: bool) -> Vec<ComparableEvent> {
                 if let Some(object) = payload.as_object_mut() {
                     object.remove("id");
                 }
+            }
+            if !ignores.is_empty() {
+                let mut path = vec!["payload".to_owned()];
+                apply_ignores_at(&mut payload, &mut path, ignores);
             }
             Some(ComparableEvent {
                 direction: direction.to_owned(),
@@ -138,9 +235,10 @@ pub fn compare_traces(
     right: &[Value],
     strict_ids: bool,
     max_differences: usize,
+    ignores: &[IgnoreRule],
 ) -> TraceDiff {
-    let left = protocol_events(left, strict_ids);
-    let right = protocol_events(right, strict_ids);
+    let left = protocol_events(left, strict_ids, ignores);
+    let right = protocol_events(right, strict_ids, ignores);
     let mut differences = Vec::new();
     let mut differences_found = 0;
 
@@ -210,6 +308,10 @@ pub fn compare_traces(
         right_events: right.len(),
         differences_found,
         ignored_request_ids: !strict_ids,
+        ignored: ignores
+            .iter()
+            .map(|rule| rule.source().to_owned())
+            .collect(),
         truncated: differences_found > differences.len(),
         differences,
     }
@@ -244,8 +346,8 @@ mod tests {
             Some("initialize"),
             json!({ "id": "new-id", "method": "initialize", "params": {} }),
         )];
-        assert!(compare_traces(&left, &right, false, 20).equal);
-        assert!(!compare_traces(&left, &right, true, 20).equal);
+        assert!(compare_traces(&left, &right, false, 20, &[]).equal);
+        assert!(!compare_traces(&left, &right, true, 20, &[]).equal);
     }
 
     #[test]
@@ -262,12 +364,101 @@ mod tests {
             Some("turn/start"),
             json!({ "id": 2, "method": "turn/start", "params": { "input": [{ "text": "goodbye" }] } }),
         )];
-        let comparison = compare_traces(&left, &right, false, 20);
+        let comparison = compare_traces(&left, &right, false, 20, &[]);
         assert_eq!(comparison.differences_found, 1);
         assert_eq!(
             comparison.differences[0].changes[0].path,
             "/payload/params/input/0/text"
         );
+    }
+
+    fn rules(sources: &[&str]) -> Vec<IgnoreRule> {
+        sources
+            .iter()
+            .map(|source| IgnoreRule::parse(source).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn ignores_run_varying_values_by_key_anywhere() {
+        let left = vec![event(
+            "client_to_server",
+            "request",
+            Some("turn/start"),
+            json!({ "method": "turn/start", "params": { "threadId": "thread-a", "input": [] } }),
+        )];
+        let right = vec![event(
+            "client_to_server",
+            "request",
+            Some("turn/start"),
+            json!({ "method": "turn/start", "params": { "threadId": "thread-b", "input": [] } }),
+        )];
+        assert!(!compare_traces(&left, &right, false, 20, &[]).equal);
+        let comparison = compare_traces(&left, &right, false, 20, &rules(&["threadId"]));
+        assert!(comparison.equal);
+        assert_eq!(comparison.ignored, vec!["threadId"]);
+    }
+
+    #[test]
+    fn ignored_key_still_reports_presence_mismatch() {
+        let left = vec![event(
+            "client_to_server",
+            "request",
+            Some("turn/start"),
+            json!({ "method": "turn/start", "params": { "threadId": "thread-a" } }),
+        )];
+        let right = vec![event(
+            "client_to_server",
+            "request",
+            Some("turn/start"),
+            json!({ "method": "turn/start", "params": {} }),
+        )];
+        let comparison = compare_traces(&left, &right, false, 20, &rules(&["threadId"]));
+        assert_eq!(comparison.differences_found, 1);
+        let change = &comparison.differences[0].changes[0];
+        assert_eq!(change.path, "/payload/params/threadId");
+        assert_eq!(change.left, Some(Value::String(IGNORED.into())));
+        assert_eq!(change.right, None);
+    }
+
+    #[test]
+    fn ignores_values_by_pointer_with_wildcard_segments() {
+        let payload = |text: &str, cwd: &str| {
+            json!({ "method": "turn/start", "params": {
+                "input": [{ "type": "text", "text": text }],
+                "cwd": cwd
+            } })
+        };
+        let left = vec![event(
+            "client_to_server",
+            "request",
+            Some("turn/start"),
+            payload("hello", "/tmp/run-1"),
+        )];
+        let right = vec![event(
+            "client_to_server",
+            "request",
+            Some("turn/start"),
+            payload("goodbye", "/tmp/run-2"),
+        )];
+        let text_only = rules(&["/payload/params/input/*/text"]);
+        let comparison = compare_traces(&left, &right, false, 20, &text_only);
+        // The text difference is ignored; the cwd difference still surfaces.
+        assert_eq!(comparison.differences_found, 1);
+        assert_eq!(
+            comparison.differences[0].changes[0].path,
+            "/payload/params/cwd"
+        );
+        let both = rules(&["/payload/params/input/*/text", "/payload/params/cwd"]);
+        assert!(compare_traces(&left, &right, false, 20, &both).equal);
+    }
+
+    #[test]
+    fn ignore_rule_parsing_rejects_malformed_input() {
+        assert!(IgnoreRule::parse("").is_err());
+        assert!(IgnoreRule::parse("/payload//text").is_err());
+        let escaped = IgnoreRule::parse("/payload/a~1b").unwrap();
+        assert!(escaped.matches(Some("a/b"), &["payload".into(), "a/b".into()]));
     }
 
     #[test]
@@ -292,6 +483,6 @@ mod tests {
         );
         let left = vec![request.clone(), response.clone(), notification.clone()];
         let right = vec![request, notification, response];
-        assert!(compare_traces(&left, &right, false, 20).equal);
+        assert!(compare_traces(&left, &right, false, 20, &[]).equal);
     }
 }

@@ -2,10 +2,10 @@ use agentwire::core::{
     load_trace, method_of, parse_message, remember_request_id, rewrite_response_id, summarize,
     TraceRecorder,
 };
-use agentwire::diff::{compare_traces, ComparableEvent, TraceDiff};
+use agentwire::diff::{compare_traces, ComparableEvent, IgnoreRule, TraceDiff};
 use agentwire::replay::plan_replay;
 use agentwire::web::{serve_forever, WebServer};
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -61,6 +61,12 @@ enum Commands {
         /// Maximum number of event differences to print.
         #[arg(long, default_value_t = 20)]
         max_differences: usize,
+        /// Treat a run-varying payload value as equal: a bare key name
+        /// (threadId) matches that key anywhere; a JSON pointer as printed
+        /// by diff (/payload/params/cwd) matches one location, with *
+        /// matching any single segment. Repeatable.
+        #[arg(long = "ignore", value_name = "KEY|POINTER")]
+        ignore: Vec<String>,
     },
     /// Act as a deterministic fake App Server from a trace.
     Replay {
@@ -217,8 +223,13 @@ fn print_trace_diff(comparison: &TraceDiff) {
         } else {
             ""
         };
+        let ignore_note = if comparison.ignored.is_empty() {
+            String::new()
+        } else {
+            format!("; {} ignore rule(s) applied", comparison.ignored.len())
+        };
         println!(
-            "traces are protocol-equivalent ({} events{id_note})",
+            "traces are protocol-equivalent ({} events{id_note}{ignore_note})",
             comparison.left_events
         );
         return;
@@ -259,15 +270,22 @@ fn diff(
     as_json: bool,
     strict_ids: bool,
     max_differences: usize,
+    ignore: Vec<String>,
 ) -> Result<i32> {
     if max_differences == 0 {
         bail!("--max-differences must be at least 1");
     }
+    let ignores = ignore
+        .iter()
+        .map(|rule| IgnoreRule::parse(rule))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| anyhow!("{error}"))?;
     let comparison = compare_traces(
         &load_trace(&left)?,
         &load_trace(&right)?,
         strict_ids,
         max_differences,
+        &ignores,
     );
     if as_json {
         println!("{}", serde_json::to_string_pretty(&comparison)?);
@@ -374,7 +392,8 @@ fn run() -> Result<i32> {
             json,
             strict_ids,
             max_differences,
-        } => diff(left, right, json, strict_ids, max_differences),
+            ignore,
+        } => diff(left, right, json, strict_ids, max_differences, ignore),
         Commands::Replay {
             trace,
             speed,
