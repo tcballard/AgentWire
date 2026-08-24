@@ -74,7 +74,7 @@ enum Commands {
         /// Timing multiplier; zero emits immediately.
         #[arg(long, default_value_t = 0.0)]
         speed: f64,
-        /// Require exact client payloads.
+        /// Require exact client payloads (transport request IDs excepted).
         #[arg(long)]
         strict_payload: bool,
     },
@@ -295,6 +295,15 @@ fn diff(
     Ok(if comparison.equal { 0 } else { 1 })
 }
 
+fn payload_without_transport_id(payload: &Value) -> Value {
+    let Some(object) = payload.as_object() else {
+        return payload.clone();
+    };
+    let mut object = object.clone();
+    object.remove("id");
+    Value::Object(object)
+}
+
 fn replay(trace: PathBuf, speed: f64, strict_payload: bool) -> Result<i32> {
     if speed < 0.0 {
         bail!("--speed cannot be negative");
@@ -344,7 +353,10 @@ fn replay(trace: PathBuf, speed: f64, strict_payload: bool) -> Result<i32> {
             );
         }
         remember_request_id(&expected.payload, &incoming, &mut id_map);
-        if strict_payload && incoming != expected.payload {
+        if strict_payload
+            && payload_without_transport_id(&incoming)
+                != payload_without_transport_id(&expected.payload)
+        {
             bail!("payload mismatch for {incoming_method:?}");
         }
         previous_elapsed = previous_elapsed.max(expected.elapsed_ms);
