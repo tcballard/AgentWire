@@ -9,6 +9,7 @@ use std::time::Duration;
 const CLIENT_INPUT: &str = include_str!("fixtures/client.jsonl");
 const CHANGED_CLIENT_INPUT: &str = include_str!("fixtures/client-changed.jsonl");
 const ACP_CLIENT_INPUT: &str = include_str!("fixtures/acp-client.jsonl");
+const MCP_CLIENT_INPUT: &str = include_str!("fixtures/mcp-client.jsonl");
 
 fn run_with_input(command: &mut Command, input: &str) -> Output {
     let mut child = command
@@ -255,6 +256,101 @@ fn acp_replay_forwards_permission_request_to_interactive_client() {
     let done = receive(&session.receiver);
     assert_eq!(done["id"], "live-3");
     assert_eq!(done["result"]["stopReason"], "end_turn");
+    drop(session.input);
+    assert!(session.child.wait().unwrap().success());
+}
+
+#[test]
+fn mcp_record_inspect_and_replay_round_trip() {
+    let directory = tempfile::tempdir().unwrap();
+    let trace = directory.path().join("mcp.jsonl");
+    let agentwire = env!("CARGO_BIN_EXE_agentwire");
+
+    let record = record_trace(
+        env!("CARGO_BIN_EXE_agentwire-mock-mcp-server"),
+        MCP_CLIENT_INPUT,
+        &trace,
+    );
+    assert!(String::from_utf8_lossy(&record.stdout).contains("A protocol tap."));
+
+    let inspect = Command::new(agentwire)
+        .arg("inspect")
+        .arg(&trace)
+        .arg("--json")
+        .output()
+        .unwrap();
+    assert!(
+        inspect.status.success(),
+        "{}",
+        String::from_utf8_lossy(&inspect.stderr)
+    );
+    let summary: Value = serde_json::from_slice(&inspect.stdout).unwrap();
+    assert_eq!(summary["client_messages"], 5);
+    assert_eq!(summary["server_messages"], 5);
+    assert_eq!(summary["methods"]["sampling/createMessage"], 1);
+
+    let replay = run_with_input(
+        Command::new(agentwire).arg("replay").arg(&trace),
+        MCP_CLIENT_INPUT,
+    );
+    assert!(
+        replay.status.success(),
+        "{}",
+        String::from_utf8_lossy(&replay.stderr)
+    );
+    assert_eq!(replay.stdout, record.stdout);
+}
+
+#[test]
+fn mcp_replay_forwards_sampling_request_to_interactive_client() {
+    let directory = tempfile::tempdir().unwrap();
+    let trace = directory.path().join("mcp-pipelined.jsonl");
+    record_trace(
+        env!("CARGO_BIN_EXE_agentwire-mock-mcp-server"),
+        MCP_CLIENT_INPUT,
+        &trace,
+    );
+
+    let mut session = spawn_interactive_replay(&trace);
+    send(
+        &mut session.input,
+        r#"{"jsonrpc":"2.0","id":"live-1","method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{"sampling":{}},"clientInfo":{"name":"live","version":"0.1"}}}"#,
+    );
+    let response = receive(&session.receiver);
+    assert_eq!(response["id"], "live-1");
+    assert_eq!(response["result"]["protocolVersion"], "2025-06-18");
+    send(
+        &mut session.input,
+        r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+    );
+    send(
+        &mut session.input,
+        r#"{"jsonrpc":"2.0","id":"live-2","method":"tools/list"}"#,
+    );
+    let tools = receive(&session.receiver);
+    assert_eq!(tools["id"], "live-2");
+    assert_eq!(tools["result"]["tools"][0]["name"], "summarize");
+    assert_eq!(
+        receive(&session.receiver)["method"],
+        "notifications/message"
+    );
+    // The server-initiated sampling request arrives with its recorded ID,
+    // and the tool result stays held until the client answers it.
+    let sampling = receive(&session.receiver);
+    assert_eq!(sampling["method"], "sampling/createMessage");
+    assert_eq!(sampling["id"], "samp-1");
+    send(
+        &mut session.input,
+        r#"{"jsonrpc":"2.0","id":"live-3","method":"tools/call","params":{"name":"summarize","arguments":{"text":"AgentWire records agent protocols."}}}"#,
+    );
+    send(
+        &mut session.input,
+        r#"{"jsonrpc":"2.0","id":"samp-1","result":{"role":"assistant","content":{"type":"text","text":"A protocol tap."},"model":"mock-model","stopReason":"endTurn"}}"#,
+    );
+    let result = receive(&session.receiver);
+    assert_eq!(result["id"], "live-3");
+    assert_eq!(result["result"]["content"][0]["text"], "A protocol tap.");
+    assert_eq!(result["result"]["isError"], false);
     drop(session.input);
     assert!(session.child.wait().unwrap().success());
 }
