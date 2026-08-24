@@ -304,6 +304,47 @@ fn diff_ignores_run_varying_fields() {
 }
 
 #[test]
+fn replay_strict_payload_ignores_transport_ids() {
+    let directory = tempfile::tempdir().unwrap();
+    let trace = directory.path().join("strict.jsonl");
+    let agentwire = env!("CARGO_BIN_EXE_agentwire");
+    record_trace(
+        env!("CARGO_BIN_EXE_agentwire-mock-server"),
+        CLIENT_INPUT,
+        &trace,
+    );
+
+    // Identical payloads under fresh transport IDs must pass strict mode.
+    let remapped = CLIENT_INPUT
+        .replace(r#""id":1"#, r#""id":"live-a""#)
+        .replace(r#""id":2"#, r#""id":"live-b""#)
+        .replace(r#""id":3"#, r#""id":"live-c""#);
+    let replay = run_with_input(
+        Command::new(agentwire)
+            .arg("replay")
+            .arg(&trace)
+            .arg("--strict-payload"),
+        &remapped,
+    );
+    assert!(
+        replay.status.success(),
+        "{}",
+        String::from_utf8_lossy(&replay.stderr)
+    );
+
+    // A genuinely changed payload must still fail.
+    let changed = run_with_input(
+        Command::new(agentwire)
+            .arg("replay")
+            .arg(&trace)
+            .arg("--strict-payload"),
+        CHANGED_CLIENT_INPUT,
+    );
+    assert_eq!(changed.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&changed.stderr).contains("payload mismatch"));
+}
+
+#[test]
 fn diff_identifies_protocol_payload_regression() {
     let directory = tempfile::tempdir().unwrap();
     let left = directory.path().join("before.jsonl");

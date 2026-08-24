@@ -156,8 +156,8 @@ agentwire replay tests/fixtures/login-flow.jsonl
 
 Replay checks that the client sends the recorded methods in the recorded
 order and exits non-zero on drift, so the fixture doubles as a protocol
-assertion; add `--strict-payload` to require byte-identical requests. Pair
-it with `diff` to catch behavioural drift
+assertion; add `--strict-payload` to require identical requests apart from
+transport request IDs. Pair it with `diff` to catch behavioural drift
 between client versions or Codex releases, ignoring the values the server
 generates freshly on every run:
 
