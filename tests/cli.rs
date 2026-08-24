@@ -260,6 +260,50 @@ fn acp_replay_forwards_permission_request_to_interactive_client() {
 }
 
 #[test]
+fn diff_ignores_run_varying_fields() {
+    let directory = tempfile::tempdir().unwrap();
+    let left = directory.path().join("run-1.jsonl");
+    let right = directory.path().join("run-2.jsonl");
+    let agentwire = env!("CARGO_BIN_EXE_agentwire");
+    let mock = env!("CARGO_BIN_EXE_agentwire-mock-server");
+
+    // The same scripted session with a freshly generated thread ID, as a
+    // real agent produces on every run.
+    let varied = CLIENT_INPUT.replace("thread-demo", "thread-other");
+    record_trace(mock, CLIENT_INPUT, &left);
+    record_trace(mock, &varied, &right);
+
+    let strict = Command::new(agentwire)
+        .arg("diff")
+        .arg(&left)
+        .arg(&right)
+        .arg("--json")
+        .output()
+        .unwrap();
+    assert_eq!(strict.status.code(), Some(1));
+    let comparison: Value = serde_json::from_slice(&strict.stdout).unwrap();
+    assert_eq!(
+        comparison["differences"][0]["changes"][0]["path"],
+        "/payload/params/threadId"
+    );
+
+    let ignored = Command::new(agentwire)
+        .arg("diff")
+        .arg(&left)
+        .arg(&right)
+        .arg("--ignore")
+        .arg("threadId")
+        .output()
+        .unwrap();
+    assert!(
+        ignored.status.success(),
+        "{}",
+        String::from_utf8_lossy(&ignored.stdout)
+    );
+    assert!(String::from_utf8_lossy(&ignored.stdout).contains("1 ignore rule(s) applied"));
+}
+
+#[test]
 fn diff_identifies_protocol_payload_regression() {
     let directory = tempfile::tempdir().unwrap();
     let left = directory.path().join("before.jsonl");

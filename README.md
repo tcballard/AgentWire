@@ -71,6 +71,20 @@ traces differ: 1 protocol event(s) differ (11 left, 11 right)
 for an invalid trace or command. Use `--json` in CI and `--strict-ids` when
 transport request IDs are themselves significant.
 
+Real agents generate fresh thread IDs, turn IDs, and timestamps on every run,
+so two recordings of the same scripted session differ in values that do not
+matter. Mark those with `--ignore`: a bare key name matches that key at any
+depth; a JSON pointer exactly as diff prints it matches one location, with
+`*` matching any single segment.
+
+```bash
+agentwire diff --ignore threadId --ignore turnId \
+  --ignore "/payload/params/cwd" before.jsonl after.jsonl
+```
+
+Ignored values compare as `[ignored]`, so a field that disappears entirely is
+still reported.
+
 Replay the trace as a fake App Server:
 
 ```bash
@@ -143,12 +157,14 @@ agentwire replay tests/fixtures/login-flow.jsonl
 Replay checks that the client sends the recorded methods in the recorded
 order and exits non-zero on drift, so the fixture doubles as a protocol
 assertion; add `--strict-payload` to require byte-identical requests. Pair
-it with `diff` to catch behavioural drift between client versions or Codex
-releases:
+it with `diff` to catch behavioural drift
+between client versions or Codex releases, ignoring the values the server
+generates freshly on every run:
 
 ```bash
 agentwire record --trace current.jsonl -- codex app-server < scripted-session.jsonl
-agentwire diff --json tests/fixtures/login-flow.jsonl current.jsonl
+agentwire diff --json --ignore threadId --ignore turnId \
+  tests/fixtures/login-flow.jsonl current.jsonl
 ```
 
 `diff` exits `0` for protocol-equivalent traces and `1` on any difference,
