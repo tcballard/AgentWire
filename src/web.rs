@@ -37,6 +37,10 @@ fn response(status: &str, content_type: &str, body: &[u8], no_store: bool) -> Ve
 }
 
 fn handle(mut stream: TcpStream, trace: &Path) -> Result<()> {
+    // Sockets accepted from a non-blocking listener inherit the flag on
+    // macOS and the BSDs (unlike Linux); reading would then fail with
+    // WouldBlock before the request arrives and reset the connection.
+    stream.set_nonblocking(false)?;
     stream.set_read_timeout(Some(Duration::from_secs(2)))?;
     let mut request = Vec::with_capacity(1024);
     let mut chunk = [0_u8; 1024];
