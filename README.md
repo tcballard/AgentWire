@@ -1,18 +1,18 @@
 # AgentWire
 
-**tcpdump + VCR for coding-agent protocols — Codex App Server and ACP.**
+**tcpdump + VCR for coding-agent protocols — Codex App Server, ACP, and MCP.**
 
 [![CI](https://github.com/tcballard/AgentWire/actions/workflows/ci.yml/badge.svg)](https://github.com/tcballard/AgentWire/actions/workflows/ci.yml)
 
 AgentWire is a native Rust protocol tap for developers building coding-agent
 clients. It proxies the exact JSONL bytes between a client and a coding-agent
-process — `codex app-server` or any [ACP](https://agentclientprotocol.com)
-agent — writes private redacted traces, diffs runs down to the changed payload
-path, and replays recorded server behaviour deterministically—without another
-model call.
+process — `codex app-server`, an [ACP](https://agentclientprotocol.com) agent,
+or an [MCP](https://modelcontextprotocol.io) server — writes private redacted
+traces, diffs runs down to the changed payload path, and replays recorded
+server behaviour deterministically—without another model call.
 
 This is an independent community project. It is not affiliated with or endorsed
-by OpenAI or Zed Industries.
+by OpenAI, Zed Industries, or Anthropic.
 
 ## Install
 
@@ -194,6 +194,25 @@ ACP agent with a permission round trip, driven by
 `tests/fixtures/acp-client.jsonl` the same way as the App Server mock
 above.
 
+## MCP servers
+
+The same applies to [Model Context Protocol](https://modelcontextprotocol.io)
+servers, which also speak newline-delimited JSON-RPC over stdio. Wrap the
+server command in your client's MCP configuration:
+
+```bash
+agentwire record --trace mcp-session.jsonl -- your-mcp-server
+```
+
+The MCP server is the server side of the trace. Server-initiated requests
+such as `sampling/createMessage` record, diff, and replay like any other
+message, so `agentwire replay` stands in as a deterministic fake MCP server
+for client tests: no tools actually execute and no model gets called.
+
+The test-support build produces `agentwire-mock-mcp-server`, a mock server
+whose tool call round-trips a sampling request, driven by
+`tests/fixtures/mcp-client.jsonl`.
+
 ## Trace format
 
 Trace format version 1 is unchanged from the prototype. Each line is an
@@ -230,8 +249,8 @@ Redaction is defense in depth, not a guarantee. Review a trace before sharing it
 
 ## Current limits
 
-- Newline-delimited JSON-RPC over stdio only. Codex App Server and ACP are
-  covered by tests; other agents using the same framing should work
+- Newline-delimited JSON-RPC over stdio only. Codex App Server, ACP, and
+  MCP are covered by tests; other agents using the same framing should work
   unchanged.
 - Replay validates client method order and response causality, not full
   application state. It assumes a client's next message depends only on
