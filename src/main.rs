@@ -100,7 +100,7 @@ fn record(trace: Option<PathBuf>, ui: Option<String>, command: Vec<OsString>) ->
     let recorder = Arc::new(TraceRecorder::new(&trace, &command)?);
     let inspector = ui
         .as_deref()
-        .map(|listen| WebServer::start(trace.clone(), listen))
+        .map(|listen| WebServer::start_live(Arc::clone(&recorder), listen))
         .transpose()?;
     if let Some(inspector) = inspector.as_ref() {
         eprintln!("AgentWire inspector: {}", inspector.url());

@@ -17,15 +17,20 @@ by OpenAI, Zed Industries, or Anthropic.
 ## Install
 
 ```bash
-cargo install --locked agentwire
+cargo install --locked --git https://github.com/tcballard/AgentWire
 ```
 
-Prebuilt binaries for Linux, macOS, and Windows are attached to each
-[GitHub release](https://github.com/tcballard/AgentWire/releases). To build
-the latest development version instead:
+AgentWire is not yet published to crates.io and does not yet ship prebuilt
+binaries. Pin an exact revision when reproducibility matters:
 
 ```bash
-cargo install --locked --git https://github.com/tcballard/AgentWire
+cargo install --locked --git https://github.com/tcballard/AgentWire --rev <40-character-commit>
+```
+
+From a local checkout:
+
+```bash
+cargo install --locked --path .
 ```
 
 ## Quick start
@@ -134,6 +139,42 @@ Then inspect and replay:
 target/debug/agentwire inspect demo.jsonl
 target/debug/agentwire serve demo.jsonl
 target/debug/agentwire replay demo.jsonl
+```
+
+## Inspector API
+
+The inspector exposes two loopback HTTP endpoints. `GET /api/events` retains
+the complete trace-event response used by the browser UI. `GET /api/summary`
+is the small, versioned status contract intended for desktop integrations such
+as omarchy-agentwire. Both responses use `application/json` and
+`Cache-Control: no-store`.
+
+The v1 summary fields are captured in
+[`contracts/inspector-summary-v1.example.json`](contracts/inspector-summary-v1.example.json).
+`mode` is `live_record` while `agentwire record --ui` owns the trace and
+`served_trace` for `agentwire serve`. `active` is true only for a live record
+before its `session_end` event. A completed recording has `ended: true` and an
+optional signed 32-bit `exit_code`; served traces are never reported active,
+even when their final event is missing.
+
+To keep the response bounded, `session_id`, `started_at`, and `last_method`
+are limited to 128, 64, and 256 Unicode scalar values respectively. Counts
+describe non-meta protocol events. `errors` follows `agentwire inspect` and
+counts events containing a `payload.error` member, including a JSON null.
+
+Live summaries are maintained in memory in constant time as events are
+written. The live endpoint rejects a missing, unreadable, or replaced trace
+path instead of silently describing another file. Served summaries are cached
+against file metadata and rescanned when the saved trace changes; a trace that
+is continually appended while served can therefore cause repeated full-file
+scans. On non-Unix platforms, a same-size rewrite that also preserves all
+available timestamps may remain cached.
+
+If the trace cannot be read or validated, `/api/summary` returns HTTP 500 with
+the stable body:
+
+```json
+{"api_version":1,"error":{"code":"trace_unavailable","message":"trace unavailable"}}
 ```
 
 ## Fixture-driven client tests
