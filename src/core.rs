@@ -1,7 +1,7 @@
 use anyhow::{bail, Context, Result};
 use chrono::{SecondsFormat, Utc};
 use regex::{Captures, Regex};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsString;
@@ -25,14 +25,15 @@ fn bounded(value: &str, limit: usize) -> String {
     value.chars().take(limit).collect()
 }
 
-#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum InspectorMode {
     LiveRecord,
     ServedTrace,
 }
 
-#[derive(Clone, Debug, Serialize, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct InspectorSummary {
     pub api_version: u64,
     pub trace_version: u64,
@@ -49,6 +50,41 @@ pub struct InspectorSummary {
     pub invalid_messages: usize,
     pub errors: usize,
     pub last_method: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct InspectorSnapshot {
+    pub trace: PathBuf,
+    pub summary: InspectorSummary,
+}
+
+impl InspectorSnapshot {
+    pub fn validate(&self) -> Result<()> {
+        let summary = &self.summary;
+        if summary.api_version != INSPECTOR_API_VERSION || summary.trace_version != TRACE_VERSION {
+            bail!("unsupported inspector snapshot version");
+        }
+        if summary.session_id.chars().count() > INSPECTOR_SESSION_ID_LIMIT
+            || summary.started_at.chars().count() > INSPECTOR_STARTED_AT_LIMIT
+            || summary
+                .last_method
+                .as_deref()
+                .is_some_and(|value| value.chars().count() > INSPECTOR_LAST_METHOD_LIMIT)
+        {
+            bail!("inspector snapshot contains an oversized string");
+        }
+        if !summary.duration_ms.is_finite() || summary.duration_ms < 0.0 {
+            bail!("inspector snapshot contains an invalid duration");
+        }
+        if summary.active != (summary.mode == InspectorMode::LiveRecord && !summary.ended) {
+            bail!("inspector snapshot lifecycle is inconsistent");
+        }
+        if self.trace.as_os_str().is_empty() || !self.trace.is_absolute() {
+            bail!("inspector snapshot trace path must be absolute");
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -304,12 +340,28 @@ pub struct TraceRecorder {
     path: PathBuf,
     session_id: String,
     started: Instant,
+    snapshot_path: Option<PathBuf>,
     state: Mutex<RecorderState>,
 }
 
 impl TraceRecorder {
     pub fn new(path: impl Into<PathBuf>, command: &[OsString]) -> Result<Self> {
-        let path = path.into();
+        Self::new_inner(path.into(), command, None)
+    }
+
+    pub fn new_published(
+        path: impl Into<PathBuf>,
+        command: &[OsString],
+        snapshot_path: impl Into<PathBuf>,
+    ) -> Result<Self> {
+        Self::new_inner(path.into(), command, Some(snapshot_path.into()))
+    }
+
+    fn new_inner(
+        path: PathBuf,
+        command: &[OsString],
+        snapshot_path: Option<PathBuf>,
+    ) -> Result<Self> {
         if let Some(parent) = path
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
@@ -329,6 +381,7 @@ impl TraceRecorder {
             path,
             session_id: session_id(),
             started: Instant::now(),
+            snapshot_path,
             state: Mutex::new(RecorderState {
                 writer: Some(BufWriter::new(file)),
                 sequence: 0,
@@ -357,6 +410,9 @@ impl TraceRecorder {
         writer.write_all(b"\n")?;
         writer.flush()?;
         state.inspector.observe(&event);
+        let summary = state.inspector.summary(InspectorMode::LiveRecord);
+        drop(state);
+        self.publish_snapshot(&summary)?;
         Ok(())
     }
 
@@ -422,9 +478,12 @@ impl TraceRecorder {
         writer.write_all(b"\n")?;
         writer.flush()?;
         state.inspector.observe(&value);
+        let summary = state.inspector.summary(InspectorMode::LiveRecord);
         if let Some(mut writer) = state.writer.take() {
             writer.flush()?;
         }
+        drop(state);
+        self.publish_snapshot(&summary)?;
         Ok(())
     }
 
@@ -435,6 +494,91 @@ impl TraceRecorder {
             .inspector
             .summary(InspectorMode::LiveRecord)
     }
+
+    fn publish_snapshot(&self, summary: &InspectorSummary) -> Result<()> {
+        let Some(path) = self.snapshot_path.as_deref() else {
+            return Ok(());
+        };
+        let trace = self
+            .path
+            .canonicalize()
+            .with_context(|| format!("could not resolve trace {}", self.path.display()))?;
+        write_inspector_snapshot(
+            path,
+            &InspectorSnapshot {
+                trace,
+                summary: summary.clone(),
+            },
+        )
+    }
+}
+
+pub fn write_inspector_snapshot(path: &Path, snapshot: &InspectorSnapshot) -> Result<()> {
+    snapshot.validate()?;
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .context("inspector snapshot path needs a parent directory")?;
+    if !parent.exists() {
+        let mut builder = std::fs::DirBuilder::new();
+        builder.recursive(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        builder
+            .create(parent)
+            .with_context(|| format!("could not create snapshot directory {}", parent.display()))?;
+    }
+    if std::fs::symlink_metadata(parent)?.file_type().is_symlink() {
+        bail!("inspector snapshot directory must not be a symlink");
+    }
+
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let temporary = parent.join(format!(
+        ".{}.tmp-{}-{nonce}",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("inspector"),
+        std::process::id()
+    ));
+    let result = (|| -> Result<()> {
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let mut file = options
+            .open(&temporary)
+            .with_context(|| format!("could not create snapshot {}", temporary.display()))?;
+        serde_json::to_writer(&mut file, snapshot)?;
+        file.write_all(b"\n")?;
+        file.sync_all()?;
+        std::fs::rename(&temporary, path)
+            .with_context(|| format!("could not publish snapshot {}", path.display()))?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    result
+}
+
+pub fn load_inspector_snapshot(path: &Path) -> Result<InspectorSnapshot> {
+    const MAX_SNAPSHOT_BYTES: u64 = 64 * 1024;
+    let metadata = std::fs::symlink_metadata(path)
+        .with_context(|| format!("could not inspect snapshot {}", path.display()))?;
+    if !metadata.file_type().is_file() || metadata.len() > MAX_SNAPSHOT_BYTES {
+        bail!("inspector snapshot is not a bounded regular file");
+    }
+    let snapshot: InspectorSnapshot = serde_json::from_reader(BufReader::new(
+        File::open(path).with_context(|| format!("could not open snapshot {}", path.display()))?,
+    ))?;
+    snapshot.validate()?;
+    Ok(snapshot)
 }
 
 pub fn load_trace(path: &Path) -> Result<Vec<Value>> {
@@ -737,6 +881,71 @@ mod tests {
         );
         assert_eq!(recorder.inspector_summary().exit_code, Some(7));
         assert_eq!(recorder.inspector_summary().events, 0);
+    }
+
+    #[test]
+    fn published_snapshot_tracks_live_and_completed_recording() {
+        let directory = tempfile::tempdir().unwrap();
+        let trace = directory.path().join("trace.jsonl");
+        let snapshot = directory.path().join("runtime/inspector.json");
+        let recorder = TraceRecorder::new_published(&trace, &[], &snapshot).unwrap();
+        let initial = load_inspector_snapshot(&snapshot).unwrap();
+        assert_eq!(initial.trace, trace.canonicalize().unwrap());
+        assert!(initial.summary.active);
+        assert_eq!(initial.summary.events, 0);
+
+        recorder
+            .record_line("client_to_server", b"{\"method\":\"initialize\"}\n")
+            .unwrap();
+        let live = load_inspector_snapshot(&snapshot).unwrap();
+        assert_eq!(live.summary.events, 1);
+        assert_eq!(live.summary.last_method.as_deref(), Some("initialize"));
+
+        recorder.close(Some(-9)).unwrap();
+        let completed = load_inspector_snapshot(&snapshot).unwrap();
+        assert!(!completed.summary.active);
+        assert!(completed.summary.ended);
+        assert_eq!(completed.summary.exit_code, Some(-9));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(snapshot).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+    }
+
+    #[test]
+    fn snapshot_loader_rejects_unbounded_or_inconsistent_state() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("snapshot.json");
+        std::fs::write(&path, vec![b'x'; 64 * 1024 + 1]).unwrap();
+        assert!(load_inspector_snapshot(&path).is_err());
+
+        let trace = directory.path().join("trace.jsonl");
+        std::fs::write(&trace, b"").unwrap();
+        let bad = InspectorSnapshot {
+            trace: trace.canonicalize().unwrap(),
+            summary: InspectorSummary {
+                api_version: 1,
+                trace_version: 1,
+                mode: InspectorMode::LiveRecord,
+                active: false,
+                session_id: "session".into(),
+                started_at: "now".into(),
+                ended: false,
+                exit_code: None,
+                events: 0,
+                duration_ms: 0.0,
+                client_messages: 0,
+                server_messages: 0,
+                invalid_messages: 0,
+                errors: 0,
+                last_method: None,
+            },
+        };
+        assert!(write_inspector_snapshot(&path, &bad).is_err());
     }
 
     #[test]
