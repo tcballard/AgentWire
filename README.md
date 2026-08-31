@@ -170,6 +170,22 @@ is continually appended while served can therefore cause repeated full-file
 scans. On non-Unix platforms, a same-size rewrite that also preserves all
 available timestamps may remain cached.
 
+Desktop integrations can keep one stable inspector alive across recordings.
+Start the hub with a private snapshot path, then publish each recording to the
+same path:
+
+```bash
+agentwire hub --state "$XDG_RUNTIME_DIR/agentwire/inspector.json"
+agentwire record --publish-summary "$XDG_RUNTIME_DIR/agentwire/inspector.json" \
+  --trace session.jsonl -- codex app-server
+```
+
+The hub serves a stable unavailable response until a snapshot exists and
+switches atomically to the newest published trace. Publishing rejects symlinked
+state directories, writes owner-only snapshot files on Unix, and bounds the
+snapshot to 64 KiB. `--publish-summary` cannot be combined with `--ui`; the hub
+owns the browser endpoint in this mode.
+
 If the trace cannot be read or validated, `/api/summary` returns HTTP 500 with
 the stable body:
 
