@@ -76,6 +76,19 @@ traces differ: 1 protocol event(s) differ (11 left, 11 right)
 for an invalid trace or command. Use `--json` in CI and `--strict-ids` when
 transport request IDs are themselves significant.
 
+Check that the command you intend to wrap is resolvable before editing a client
+configuration:
+
+```bash
+agentwire doctor -- codex app-server
+agentwire doctor -- some-acp-agent
+agentwire doctor -- your-mcp-server
+```
+
+`doctor` does not launch the selected command or claim that it speaks a
+compatible protocol. It verifies executable availability; a real recording is
+still the protocol round-trip proof.
+
 Real agents generate fresh thread IDs, turn IDs, and timestamps on every run,
 so two recordings of the same scripted session differ in values that do not
 matter. Mark those with `--ignore`: a bare key name matches that key at any

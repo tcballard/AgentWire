@@ -9,9 +9,9 @@ use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand};
 use serde_json::Value;
 use std::collections::HashMap;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::io::{self, BufRead, BufReader, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{mpsc, Arc};
 use std::thread;
@@ -21,7 +21,7 @@ use std::time::Duration;
 #[command(
     name = "agentwire",
     version,
-    about = "Record and replay Codex App Server JSONL traffic"
+    about = "Record and replay coding-agent JSONL protocols"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -30,7 +30,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Run a child App Server and record both protocol directions.
+    /// Run a child JSONL protocol server and record both directions.
     Record {
         /// Trace output path (default: timestamped JSONL).
         #[arg(long)]
@@ -95,8 +95,12 @@ enum Commands {
         #[arg(long, default_value = "127.0.0.1:4777")]
         listen: String,
     },
-    /// Check whether live capture can run.
-    Doctor,
+    /// Check whether a selected JSONL server command is available to wrap.
+    Doctor {
+        /// Server command to resolve without launching it (default: codex app-server).
+        #[arg(last = true)]
+        command: Vec<OsString>,
+    },
 }
 
 fn default_trace_path() -> PathBuf {
@@ -387,29 +391,75 @@ fn replay(trace: PathBuf, speed: f64, strict_payload: bool) -> Result<i32> {
     Ok(0)
 }
 
-fn doctor() -> Result<i32> {
+fn executable_names(command: &OsStr) -> Vec<OsString> {
+    let path = Path::new(command);
+    if !cfg!(windows) || path.extension().is_some() {
+        return vec![command.to_os_string()];
+    }
+    let extensions =
+        std::env::var_os("PATHEXT").unwrap_or_else(|| OsString::from(".COM;.EXE;.BAT;.CMD"));
+    extensions
+        .to_string_lossy()
+        .split(';')
+        .filter(|extension| !extension.is_empty())
+        .map(|extension| {
+            let mut name = command.to_os_string();
+            name.push(extension);
+            name
+        })
+        .collect()
+}
+
+fn is_executable_file(path: &Path) -> bool {
+    if !path.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        path.metadata()
+            .map(|metadata| metadata.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false)
+    }
+    #[cfg(not(unix))]
+    true
+}
+
+fn resolve_executable(command: &OsStr) -> Option<PathBuf> {
+    let command_path = Path::new(command);
+    let names = executable_names(command);
+    if command_path.is_absolute() || command_path.components().count() > 1 {
+        return names
+            .into_iter()
+            .map(PathBuf::from)
+            .find(|path| is_executable_file(path));
+    }
     let path = std::env::var_os("PATH").unwrap_or_default();
-    let executable = if cfg!(windows) { "codex.exe" } else { "codex" };
-    let codex = std::env::split_paths(&path)
-        .map(|directory| directory.join(executable))
-        .find(|candidate| candidate.is_file());
+    std::env::split_paths(&path)
+        .flat_map(|directory| names.iter().map(move |name| directory.join(name)))
+        .find(|candidate| is_executable_file(candidate))
+}
+
+fn doctor(mut command: Vec<OsString>) -> Result<i32> {
+    if command.is_empty() {
+        command = vec![OsString::from("codex"), OsString::from("app-server")];
+    }
+    let target = command
+        .iter()
+        .map(|argument| argument.to_string_lossy())
+        .collect::<Vec<_>>()
+        .join(" ");
     println!("agentwire    {}", env!("CARGO_PKG_VERSION"));
     println!("runtime      native Rust binary");
-    let Some(codex) = codex else {
-        println!("codex        not found");
-        println!("status       replay works; live Codex capture is unavailable");
+    println!("target       {target}");
+    let Some(executable) = resolve_executable(&command[0]) else {
+        println!("executable   not found");
+        println!("status       replay works; live capture for this target is unavailable");
         return Ok(1);
     };
-    let output = Command::new(&codex).arg("--version").output()?;
-    let version = String::from_utf8_lossy(if output.stdout.is_empty() {
-        &output.stderr
-    } else {
-        &output.stdout
-    });
-    println!("codex        {}", codex.display());
-    println!("version      {}", version.trim());
+    println!("executable   {}", executable.display());
     println!("transport    JSONL over stdio");
-    println!("status       ready");
+    println!("status       target found; protocol compatibility is not verified");
     Ok(0)
 }
 
@@ -437,7 +487,7 @@ fn run() -> Result<i32> {
         } => replay(trace, speed, strict_payload),
         Commands::Serve { trace, listen } => serve_forever(trace, &listen).map(|_| 0),
         Commands::Hub { state, listen } => hub_forever(state, &listen).map(|_| 0),
-        Commands::Doctor => doctor(),
+        Commands::Doctor { command } => doctor(command),
     }
 }
 

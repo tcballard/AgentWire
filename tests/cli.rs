@@ -97,6 +97,46 @@ fn send(input: &mut ChildStdin, message: &str) {
 }
 
 #[test]
+fn doctor_resolves_a_selected_target_without_launching_it() {
+    let target = std::env::current_exe().unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_agentwire"))
+        .arg("doctor")
+        .arg("--")
+        .arg(&target)
+        .arg("--argument-that-must-not-run")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains(&format!(
+        "target       {} --argument-that-must-not-run",
+        target.display()
+    )));
+    assert!(stdout.contains(&format!("executable   {}", target.display())));
+    assert!(stdout.contains("transport    JSONL over stdio"));
+    assert!(stdout.contains("protocol compatibility is not verified"));
+}
+
+#[test]
+fn doctor_reports_a_missing_selected_target() {
+    let output = Command::new(env!("CARGO_BIN_EXE_agentwire"))
+        .arg("doctor")
+        .arg("--")
+        .arg("agentwire-target-that-does-not-exist")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("target       agentwire-target-that-does-not-exist"));
+    assert!(stdout.contains("executable   not found"));
+    assert!(stdout.contains("live capture for this target is unavailable"));
+}
+
+#[test]
 fn record_inspect_and_replay_round_trip() {
     let directory = tempfile::tempdir().unwrap();
     let trace = directory.path().join("round-trip.jsonl");
