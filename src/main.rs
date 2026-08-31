@@ -4,7 +4,7 @@ use agentwire::core::{
 };
 use agentwire::diff::{compare_traces, ComparableEvent, IgnoreRule, TraceDiff};
 use agentwire::replay::plan_replay;
-use agentwire::web::{serve_forever, WebServer};
+use agentwire::web::{hub_forever, serve_forever, WebServer};
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand};
 use serde_json::Value;
@@ -38,6 +38,9 @@ enum Commands {
         /// Serve the live inspector, optionally at HOST:PORT.
         #[arg(long, num_args = 0..=1, default_missing_value = "127.0.0.1:4777")]
         ui: Option<String>,
+        /// Atomically publish the live summary for an AgentWire hub.
+        #[arg(long, value_name = "PATH", conflicts_with = "ui")]
+        publish_summary: Option<PathBuf>,
         /// Child command, normally: -- codex app-server
         #[arg(last = true, required = true)]
         command: Vec<OsString>,
@@ -84,6 +87,14 @@ enum Commands {
         #[arg(long, default_value = "127.0.0.1:4777")]
         listen: String,
     },
+    /// Serve the latest session published by recording processes.
+    Hub {
+        /// Bounded current-session snapshot written by `record --publish-summary`.
+        #[arg(long, value_name = "PATH")]
+        state: PathBuf,
+        #[arg(long, default_value = "127.0.0.1:4777")]
+        listen: String,
+    },
     /// Check whether live capture can run.
     Doctor,
 }
@@ -95,9 +106,17 @@ fn default_trace_path() -> PathBuf {
     ))
 }
 
-fn record(trace: Option<PathBuf>, ui: Option<String>, command: Vec<OsString>) -> Result<i32> {
+fn record(
+    trace: Option<PathBuf>,
+    ui: Option<String>,
+    publish_summary: Option<PathBuf>,
+    command: Vec<OsString>,
+) -> Result<i32> {
     let trace = trace.unwrap_or_else(default_trace_path);
-    let recorder = Arc::new(TraceRecorder::new(&trace, &command)?);
+    let recorder = Arc::new(match publish_summary {
+        Some(snapshot) => TraceRecorder::new_published(&trace, &command, snapshot)?,
+        None => TraceRecorder::new(&trace, &command)?,
+    });
     let inspector = ui
         .as_deref()
         .map(|listen| WebServer::start_live(Arc::clone(&recorder), listen))
@@ -396,7 +415,12 @@ fn doctor() -> Result<i32> {
 
 fn run() -> Result<i32> {
     match Cli::parse().command {
-        Commands::Record { trace, ui, command } => record(trace, ui, command),
+        Commands::Record {
+            trace,
+            ui,
+            publish_summary,
+            command,
+        } => record(trace, ui, publish_summary, command),
         Commands::Inspect { trace, json } => inspect(trace, json),
         Commands::Diff {
             left,
@@ -412,6 +436,7 @@ fn run() -> Result<i32> {
             strict_payload,
         } => replay(trace, speed, strict_payload),
         Commands::Serve { trace, listen } => serve_forever(trace, &listen).map(|_| 0),
+        Commands::Hub { state, listen } => hub_forever(state, &listen).map(|_| 0),
         Commands::Doctor => doctor(),
     }
 }

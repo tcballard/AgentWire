@@ -1,4 +1,7 @@
-use crate::core::{load_inspector_summary, load_trace, TraceRecorder, INSPECTOR_API_VERSION};
+use crate::core::{
+    load_inspector_snapshot, load_inspector_summary, load_trace, InspectorSnapshot, TraceRecorder,
+    INSPECTOR_API_VERSION,
+};
 use anyhow::{bail, Context, Result};
 use serde::Serialize;
 use std::io::{Read, Write};
@@ -115,34 +118,63 @@ enum SummarySource {
     Served {
         cache: Mutex<Option<(FileFingerprint, Vec<u8>)>>,
     },
+    Hub {
+        snapshot: PathBuf,
+    },
 }
 
 struct ServerState {
-    trace: PathBuf,
+    trace: Option<PathBuf>,
     summary: SummarySource,
 }
 
 impl ServerState {
+    fn hub_snapshot(&self) -> Result<InspectorSnapshot> {
+        match &self.summary {
+            SummarySource::Hub { snapshot } => load_inspector_snapshot(snapshot),
+            _ => bail!("server is not using a hub snapshot"),
+        }
+    }
+
+    fn trace_path(&self) -> Result<PathBuf> {
+        match &self.summary {
+            SummarySource::Hub { .. } => Ok(self.hub_snapshot()?.trace),
+            _ => self
+                .trace
+                .clone()
+                .context("server trace path is unavailable"),
+        }
+    }
+
     fn summary_json(&self) -> Result<Vec<u8>> {
         match &self.summary {
             SummarySource::Live { recorder, identity } => {
-                if &FileIdentity::read(&self.trace)? != identity {
+                let trace = self
+                    .trace
+                    .as_deref()
+                    .context("live trace path is unavailable")?;
+                if &FileIdentity::read(trace)? != identity {
                     bail!("live trace path identity changed");
                 }
                 Ok(serde_json::to_vec(&recorder.inspector_summary())?)
             }
             SummarySource::Served { cache } => {
-                let fingerprint = FileFingerprint::read(&self.trace)?;
+                let trace = self
+                    .trace
+                    .as_deref()
+                    .context("served trace path is unavailable")?;
+                let fingerprint = FileFingerprint::read(trace)?;
                 let mut cache = cache.lock().expect("summary cache mutex poisoned");
                 if let Some((cached_fingerprint, body)) = cache.as_ref() {
                     if cached_fingerprint == &fingerprint {
                         return Ok(body.clone());
                     }
                 }
-                let body = serde_json::to_vec(&load_inspector_summary(&self.trace)?)?;
+                let body = serde_json::to_vec(&load_inspector_summary(trace)?)?;
                 *cache = Some((fingerprint, body.clone()));
                 Ok(body)
             }
+            SummarySource::Hub { .. } => Ok(serde_json::to_vec(&self.hub_snapshot()?.summary)?),
         }
     }
 }
@@ -200,11 +232,13 @@ fn handle(mut stream: TcpStream, state: &ServerState) -> Result<()> {
         .unwrap_or("/");
     let output = match path {
         "/" => response("200 OK", "text/html; charset=utf-8", HTML.as_bytes(), false),
-        "/api/events" => {
-            let events = load_trace(&state.trace).unwrap_or_default();
-            let body = serde_json::to_vec(&events)?;
-            response("200 OK", "application/json", &body, true)
-        }
+        "/api/events" => match state.trace_path().and_then(|trace| load_trace(&trace)) {
+            Ok(events) => {
+                let body = serde_json::to_vec(&events)?;
+                response("200 OK", "application/json", &body, true)
+            }
+            Err(_) => unavailable_response(),
+        },
         "/api/summary" => match state.summary_json() {
             Ok(body) => response("200 OK", "application/json", &body, true),
             Err(_) => unavailable_response(),
@@ -248,7 +282,7 @@ impl WebServer {
     pub fn start(trace: PathBuf, listen: &str) -> Result<Self> {
         Self::start_with_state(
             ServerState {
-                trace,
+                trace: Some(trace),
                 summary: SummarySource::Served {
                     cache: Mutex::new(None),
                 },
@@ -262,8 +296,18 @@ impl WebServer {
         let identity = FileIdentity::read(&trace)?;
         Self::start_with_state(
             ServerState {
-                trace,
+                trace: Some(trace),
                 summary: SummarySource::Live { recorder, identity },
+            },
+            listen,
+        )
+    }
+
+    pub fn start_hub(snapshot: PathBuf, listen: &str) -> Result<Self> {
+        Self::start_with_state(
+            ServerState {
+                trace: None,
+                summary: SummarySource::Hub { snapshot },
             },
             listen,
         )
@@ -321,6 +365,13 @@ pub fn serve_forever(trace: PathBuf, listen: &str) -> Result<()> {
     }
     let server = WebServer::start(trace, listen)?;
     eprintln!("AgentWire inspector: {}", server.url());
+    server.wait();
+    Ok(())
+}
+
+pub fn hub_forever(snapshot: PathBuf, listen: &str) -> Result<()> {
+    let server = WebServer::start_hub(snapshot, listen)?;
+    eprintln!("AgentWire hub: {}", server.url());
     server.wait();
     Ok(())
 }
@@ -396,6 +447,39 @@ mod tests {
         let second = get(server.address, "/api/summary");
         assert!(second.contains("\"events\":1"));
         assert!(second.contains("\"last_method\":\"late\""));
+    }
+
+    #[test]
+    fn hub_follows_atomically_published_recordings() {
+        let directory = tempfile::tempdir().unwrap();
+        let snapshot = directory.path().join("runtime/inspector.json");
+        let server = WebServer::start_hub(snapshot.clone(), "127.0.0.1:0").unwrap();
+        assert!(
+            get(server.address, "/api/summary").starts_with("HTTP/1.1 500 Internal Server Error")
+        );
+
+        let first_trace = directory.path().join("first.jsonl");
+        let first = TraceRecorder::new_published(&first_trace, &[], &snapshot).unwrap();
+        first
+            .record_line("client_to_server", b"{\"method\":\"initialize\"}\n")
+            .unwrap();
+        let first_summary = get(server.address, "/api/summary");
+        assert!(first_summary.contains("\"active\":true"));
+        assert!(first_summary.contains("\"last_method\":\"initialize\""));
+        assert!(get(server.address, "/api/events").contains("initialize"));
+
+        let second_trace = directory.path().join("second.jsonl");
+        let second = TraceRecorder::new_published(&second_trace, &[], &snapshot).unwrap();
+        second
+            .record_line("server_to_client", b"{\"method\":\"turn/completed\"}\n")
+            .unwrap();
+        second.close(Some(0)).unwrap();
+        let second_summary = get(server.address, "/api/summary");
+        assert!(second_summary.contains("\"ended\":true"));
+        assert!(second_summary.contains("\"last_method\":\"turn/completed\""));
+        let events = get(server.address, "/api/events");
+        assert!(events.contains("turn/completed"));
+        assert!(!events.contains("initialize"));
     }
 
     #[test]
