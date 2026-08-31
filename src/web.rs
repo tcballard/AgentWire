@@ -1,10 +1,11 @@
-use crate::core::load_trace;
+use crate::core::{load_inspector_summary, load_trace, TraceRecorder, INSPECTOR_API_VERSION};
 use anyhow::{bail, Context, Result};
+use serde::Serialize;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -36,7 +37,141 @@ fn response(status: &str, content_type: &str, body: &[u8], no_store: bool) -> Ve
     .collect()
 }
 
-fn handle(mut stream: TcpStream, trace: &Path) -> Result<()> {
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FileFingerprint {
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+    created: Option<std::time::SystemTime>,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(unix)]
+    changed_seconds: i64,
+    #[cfg(unix)]
+    changed_nanoseconds: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FileIdentity {
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(not(unix))]
+    created: Option<std::time::SystemTime>,
+}
+
+impl FileIdentity {
+    fn read(path: &Path) -> Result<Self> {
+        let metadata = std::fs::metadata(path)
+            .with_context(|| format!("could not inspect trace {}", path.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            Ok(Self {
+                device: metadata.dev(),
+                inode: metadata.ino(),
+            })
+        }
+        #[cfg(not(unix))]
+        Ok(Self {
+            created: metadata.created().ok(),
+        })
+    }
+}
+
+impl FileFingerprint {
+    fn read(path: &Path) -> Result<Self> {
+        let metadata = std::fs::metadata(path)
+            .with_context(|| format!("could not inspect trace {}", path.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            Ok(Self {
+                len: metadata.len(),
+                modified: metadata.modified().ok(),
+                created: metadata.created().ok(),
+                device: metadata.dev(),
+                inode: metadata.ino(),
+                changed_seconds: metadata.ctime(),
+                changed_nanoseconds: metadata.ctime_nsec(),
+            })
+        }
+        #[cfg(not(unix))]
+        Ok(Self {
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
+            created: metadata.created().ok(),
+        })
+    }
+}
+
+enum SummarySource {
+    Live {
+        recorder: Arc<TraceRecorder>,
+        identity: FileIdentity,
+    },
+    Served {
+        cache: Mutex<Option<(FileFingerprint, Vec<u8>)>>,
+    },
+}
+
+struct ServerState {
+    trace: PathBuf,
+    summary: SummarySource,
+}
+
+impl ServerState {
+    fn summary_json(&self) -> Result<Vec<u8>> {
+        match &self.summary {
+            SummarySource::Live { recorder, identity } => {
+                if &FileIdentity::read(&self.trace)? != identity {
+                    bail!("live trace path identity changed");
+                }
+                Ok(serde_json::to_vec(&recorder.inspector_summary())?)
+            }
+            SummarySource::Served { cache } => {
+                let fingerprint = FileFingerprint::read(&self.trace)?;
+                let mut cache = cache.lock().expect("summary cache mutex poisoned");
+                if let Some((cached_fingerprint, body)) = cache.as_ref() {
+                    if cached_fingerprint == &fingerprint {
+                        return Ok(body.clone());
+                    }
+                }
+                let body = serde_json::to_vec(&load_inspector_summary(&self.trace)?)?;
+                *cache = Some((fingerprint, body.clone()));
+                Ok(body)
+            }
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct ApiError<'a> {
+    api_version: u64,
+    error: ApiErrorBody<'a>,
+}
+
+#[derive(Serialize)]
+struct ApiErrorBody<'a> {
+    code: &'a str,
+    message: &'a str,
+}
+
+fn unavailable_response() -> Vec<u8> {
+    let body = serde_json::to_vec(&ApiError {
+        api_version: INSPECTOR_API_VERSION,
+        error: ApiErrorBody {
+            code: "trace_unavailable",
+            message: "trace unavailable",
+        },
+    })
+    .expect("static API error must serialize");
+    response("500 Internal Server Error", "application/json", &body, true)
+}
+
+fn handle(mut stream: TcpStream, state: &ServerState) -> Result<()> {
     // Sockets accepted from a non-blocking listener inherit the flag on
     // macOS and the BSDs (unlike Linux); reading would then fail with
     // WouldBlock before the request arrives and reset the connection.
@@ -66,10 +201,14 @@ fn handle(mut stream: TcpStream, trace: &Path) -> Result<()> {
     let output = match path {
         "/" => response("200 OK", "text/html; charset=utf-8", HTML.as_bytes(), false),
         "/api/events" => {
-            let events = load_trace(trace).unwrap_or_default();
+            let events = load_trace(&state.trace).unwrap_or_default();
             let body = serde_json::to_vec(&events)?;
             response("200 OK", "application/json", &body, true)
         }
+        "/api/summary" => match state.summary_json() {
+            Ok(body) => response("200 OK", "application/json", &body, true),
+            Err(_) => unavailable_response(),
+        },
         _ => response(
             "404 Not Found",
             "text/plain; charset=utf-8",
@@ -87,8 +226,50 @@ pub struct WebServer {
     thread: Option<JoinHandle<()>>,
 }
 
+fn inspector_url(address: SocketAddr) -> String {
+    let ip = if address.ip().is_unspecified() {
+        if address.is_ipv6() {
+            "::1".parse().expect("loopback IPv6 must parse")
+        } else {
+            "127.0.0.1".parse().expect("loopback IPv4 must parse")
+        }
+    } else {
+        address.ip()
+    };
+    let host = if ip.is_ipv6() {
+        format!("[{ip}]")
+    } else {
+        ip.to_string()
+    };
+    format!("http://{host}:{}", address.port())
+}
+
 impl WebServer {
     pub fn start(trace: PathBuf, listen: &str) -> Result<Self> {
+        Self::start_with_state(
+            ServerState {
+                trace,
+                summary: SummarySource::Served {
+                    cache: Mutex::new(None),
+                },
+            },
+            listen,
+        )
+    }
+
+    pub fn start_live(recorder: Arc<TraceRecorder>, listen: &str) -> Result<Self> {
+        let trace = recorder.path().to_path_buf();
+        let identity = FileIdentity::read(&trace)?;
+        Self::start_with_state(
+            ServerState {
+                trace,
+                summary: SummarySource::Live { recorder, identity },
+            },
+            listen,
+        )
+    }
+
+    fn start_with_state(state: ServerState, listen: &str) -> Result<Self> {
         let listener = TcpListener::bind(parse_listen(listen)?)?;
         listener.set_nonblocking(true)?;
         let address = listener.local_addr()?;
@@ -98,7 +279,7 @@ impl WebServer {
             while !thread_stop.load(Ordering::Relaxed) {
                 match listener.accept() {
                     Ok((stream, _)) => {
-                        let _ = handle(stream, &trace);
+                        let _ = handle(stream, &state);
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(25));
@@ -115,12 +296,7 @@ impl WebServer {
     }
 
     pub fn url(&self) -> String {
-        let host = if self.address.ip().is_unspecified() {
-            "127.0.0.1".to_owned()
-        } else {
-            self.address.ip().to_string()
-        };
-        format!("http://{host}:{}", self.address.port())
+        inspector_url(self.address)
     }
 
     pub fn wait(mut self) {
@@ -184,5 +360,78 @@ mod tests {
         let events = get(server.address, "/api/events");
         assert!(events.contains("initialize"));
         assert!(events.contains("Cache-Control: no-store"));
+    }
+
+    #[test]
+    fn live_summary_uses_the_recorder_aggregate() {
+        let directory = tempfile::tempdir().unwrap();
+        let trace = directory.path().join("trace.jsonl");
+        let recorder = Arc::new(TraceRecorder::new(&trace, &[]).unwrap());
+        let server = WebServer::start_live(Arc::clone(&recorder), "127.0.0.1:0").unwrap();
+        recorder
+            .record_line("client_to_server", b"{\"method\":\"initialize\"}\n")
+            .unwrap();
+        let summary = get(server.address, "/api/summary");
+        assert!(summary.starts_with("HTTP/1.1 200 OK"));
+        assert!(summary.contains("\"mode\":\"live_record\""));
+        assert!(summary.contains("\"active\":true"));
+        assert!(summary.contains("\"events\":1"));
+    }
+
+    #[test]
+    fn served_summary_is_cached_and_refreshes_after_growth() {
+        let directory = tempfile::tempdir().unwrap();
+        let trace = directory.path().join("trace.jsonl");
+        let recorder = TraceRecorder::new(&trace, &[]).unwrap();
+        recorder.close(Some(0)).unwrap();
+        let server = WebServer::start(trace.clone(), "127.0.0.1:0").unwrap();
+        let first = get(server.address, "/api/summary");
+        assert!(first.contains("\"events\":0"));
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&trace)
+            .unwrap();
+        writeln!(file, "{{\"trace_version\":1,\"direction\":\"server_to_client\",\"kind\":\"notification\",\"method\":\"late\",\"elapsed_ms\":9,\"payload\":{{}}}}")
+            .unwrap();
+        let second = get(server.address, "/api/summary");
+        assert!(second.contains("\"events\":1"));
+        assert!(second.contains("\"last_method\":\"late\""));
+    }
+
+    #[test]
+    fn invalid_trace_has_a_stable_summary_error() {
+        let directory = tempfile::tempdir().unwrap();
+        let trace = directory.path().join("trace.jsonl");
+        std::fs::write(&trace, b"not json\n").unwrap();
+        let server = WebServer::start(trace, "127.0.0.1:0").unwrap();
+        let summary = get(server.address, "/api/summary");
+        assert!(summary.starts_with("HTTP/1.1 500 Internal Server Error"));
+        assert!(summary.ends_with("{\"api_version\":1,\"error\":{\"code\":\"trace_unavailable\",\"message\":\"trace unavailable\"}}"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn live_summary_rejects_a_replaced_trace_path() {
+        let directory = tempfile::tempdir().unwrap();
+        let trace = directory.path().join("trace.jsonl");
+        let recorder = Arc::new(TraceRecorder::new(&trace, &[]).unwrap());
+        let server = WebServer::start_live(recorder, "127.0.0.1:0").unwrap();
+        std::fs::rename(&trace, directory.path().join("original.jsonl")).unwrap();
+        std::fs::write(&trace, b"").unwrap();
+        assert!(
+            get(server.address, "/api/summary").starts_with("HTTP/1.1 500 Internal Server Error")
+        );
+    }
+
+    #[test]
+    fn formats_ipv6_inspector_urls_with_brackets() {
+        assert_eq!(
+            inspector_url("[::1]:4777".parse().unwrap()),
+            "http://[::1]:4777"
+        );
+        assert_eq!(
+            inspector_url("[::]:4777".parse().unwrap()),
+            "http://[::1]:4777"
+        );
     }
 }

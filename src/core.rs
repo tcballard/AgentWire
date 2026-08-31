@@ -15,7 +15,125 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use std::os::unix::fs::OpenOptionsExt;
 
 pub const TRACE_VERSION: u64 = 1;
+pub const INSPECTOR_API_VERSION: u64 = 1;
+pub const INSPECTOR_SESSION_ID_LIMIT: usize = 128;
+pub const INSPECTOR_STARTED_AT_LIMIT: usize = 64;
+pub const INSPECTOR_LAST_METHOD_LIMIT: usize = 256;
 pub const REDACTED: &str = "[REDACTED]";
+
+fn bounded(value: &str, limit: usize) -> String {
+    value.chars().take(limit).collect()
+}
+
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum InspectorMode {
+    LiveRecord,
+    ServedTrace,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq)]
+pub struct InspectorSummary {
+    pub api_version: u64,
+    pub trace_version: u64,
+    pub mode: InspectorMode,
+    pub active: bool,
+    pub session_id: String,
+    pub started_at: String,
+    pub ended: bool,
+    pub exit_code: Option<i32>,
+    pub events: usize,
+    pub duration_ms: f64,
+    pub client_messages: usize,
+    pub server_messages: usize,
+    pub invalid_messages: usize,
+    pub errors: usize,
+    pub last_method: Option<String>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct InspectorAggregate {
+    session_id: String,
+    started_at: String,
+    ended: bool,
+    exit_code: Option<i32>,
+    events: usize,
+    duration_ms: f64,
+    client_messages: usize,
+    server_messages: usize,
+    invalid_messages: usize,
+    errors: usize,
+    last_method: Option<String>,
+}
+
+impl InspectorAggregate {
+    fn observe(&mut self, event: &Value) {
+        if self.session_id.is_empty() {
+            if let Some(value) = event.get("session_id").and_then(Value::as_str) {
+                self.session_id = bounded(value, INSPECTOR_SESSION_ID_LIMIT);
+            }
+        }
+        if let Some(elapsed) = event.get("elapsed_ms").and_then(Value::as_f64) {
+            if elapsed.is_finite() {
+                self.duration_ms = self.duration_ms.max(elapsed.max(0.0));
+            }
+        }
+        let direction = event.get("direction").and_then(Value::as_str);
+        if direction == Some("meta") {
+            match event.get("kind").and_then(Value::as_str) {
+                Some("session_start") if self.started_at.is_empty() => {
+                    if let Some(value) = event.get("timestamp").and_then(Value::as_str) {
+                        self.started_at = bounded(value, INSPECTOR_STARTED_AT_LIMIT);
+                    }
+                }
+                Some("session_end") => {
+                    self.ended = true;
+                    self.exit_code = event
+                        .pointer("/payload/exit_code")
+                        .and_then(Value::as_i64)
+                        .and_then(|value| i32::try_from(value).ok());
+                }
+                _ => {}
+            }
+            return;
+        }
+        self.events += 1;
+        match direction {
+            Some("client_to_server") => self.client_messages += 1,
+            Some("server_to_client") => self.server_messages += 1,
+            _ => {}
+        }
+        if event.get("kind").and_then(Value::as_str) == Some("invalid") {
+            self.invalid_messages += 1;
+        }
+        if event.pointer("/payload/error").is_some() {
+            self.errors += 1;
+        }
+        if let Some(method) = event.get("method").and_then(Value::as_str) {
+            self.last_method = Some(bounded(method, INSPECTOR_LAST_METHOD_LIMIT));
+        }
+    }
+
+    fn summary(&self, mode: InspectorMode) -> InspectorSummary {
+        InspectorSummary {
+            api_version: INSPECTOR_API_VERSION,
+            trace_version: TRACE_VERSION,
+            mode,
+            active: mode == InspectorMode::LiveRecord && !self.ended,
+            session_id: self.session_id.clone(),
+            started_at: self.started_at.clone(),
+            ended: self.ended,
+            exit_code: self.exit_code,
+            events: self.events,
+            duration_ms: self.duration_ms,
+            client_messages: self.client_messages,
+            server_messages: self.server_messages,
+            invalid_messages: self.invalid_messages,
+            errors: self.errors,
+            last_method: self.last_method.clone(),
+        }
+    }
+}
 
 fn bearer_re() -> &'static Regex {
     static VALUE: OnceLock<Regex> = OnceLock::new();
@@ -179,6 +297,7 @@ fn session_id() -> String {
 struct RecorderState {
     writer: Option<BufWriter<File>>,
     sequence: u64,
+    inspector: InspectorAggregate,
 }
 
 pub struct TraceRecorder {
@@ -213,6 +332,7 @@ impl TraceRecorder {
             state: Mutex::new(RecorderState {
                 writer: Some(BufWriter::new(file)),
                 sequence: 0,
+                inspector: InspectorAggregate::default(),
             }),
         };
         recorder.record_meta("session_start", json!({ "command": safe_command(command) }))?;
@@ -232,9 +352,11 @@ impl TraceRecorder {
         state.sequence += 1;
         event.insert("seq".into(), Value::from(sequence));
         let writer = state.writer.as_mut().expect("writer checked above");
-        serde_json::to_writer(&mut *writer, &Value::Object(event))?;
+        let event = Value::Object(event);
+        serde_json::to_writer(&mut *writer, &event)?;
         writer.write_all(b"\n")?;
         writer.flush()?;
+        state.inspector.observe(&event);
         Ok(())
     }
 
@@ -274,12 +396,44 @@ impl TraceRecorder {
     }
 
     pub fn close(&self, exit_code: Option<i32>) -> Result<()> {
-        self.record_meta("session_end", json!({ "exit_code": exit_code }))?;
         let mut state = self.state.lock().expect("trace recorder mutex poisoned");
+        if state.writer.is_none() {
+            return Ok(());
+        }
+        let mut event = json!({
+            "trace_version": TRACE_VERSION,
+            "session_id": self.session_id,
+            "timestamp": utc_now(),
+            "elapsed_ms": self.started.elapsed().as_secs_f64() * 1000.0,
+            "direction": "meta",
+            "kind": "session_end",
+            "method": null,
+            "id": null,
+            "payload": { "exit_code": exit_code },
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        event.insert("seq".into(), Value::from(state.sequence));
+        state.sequence += 1;
+        let value = Value::Object(event);
+        let writer = state.writer.as_mut().expect("writer checked above");
+        serde_json::to_writer(&mut *writer, &value)?;
+        writer.write_all(b"\n")?;
+        writer.flush()?;
+        state.inspector.observe(&value);
         if let Some(mut writer) = state.writer.take() {
             writer.flush()?;
         }
         Ok(())
+    }
+
+    pub fn inspector_summary(&self) -> InspectorSummary {
+        self.state
+            .lock()
+            .expect("trace recorder mutex poisoned")
+            .inspector
+            .summary(InspectorMode::LiveRecord)
     }
 }
 
@@ -306,6 +460,21 @@ pub fn load_trace(path: &Path) -> Result<Vec<Value>> {
         events.push(event);
     }
     Ok(events)
+}
+
+pub fn inspector_summary(events: &[Value], mode: InspectorMode) -> InspectorSummary {
+    let mut aggregate = InspectorAggregate::default();
+    for event in events {
+        aggregate.observe(event);
+    }
+    aggregate.summary(mode)
+}
+
+pub fn load_inspector_summary(path: &Path) -> Result<InspectorSummary> {
+    Ok(inspector_summary(
+        &load_trace(path)?,
+        InspectorMode::ServedTrace,
+    ))
 }
 
 pub fn method_of(payload: &Value) -> Option<&str> {
@@ -492,5 +661,126 @@ mod tests {
                 0o600
             );
         }
+    }
+
+    #[test]
+    fn inspector_summary_matches_the_canonical_v1_example() {
+        let expected: Value = serde_json::from_str(include_str!(
+            "../contracts/inspector-summary-v1.example.json"
+        ))
+        .unwrap();
+        let summary = InspectorSummary {
+            api_version: 1,
+            trace_version: 1,
+            mode: InspectorMode::LiveRecord,
+            active: true,
+            session_id: "1a2b-18d0b32a2bbe6d98".into(),
+            started_at: "2026-08-30T21:40:45.786Z".into(),
+            ended: false,
+            exit_code: None,
+            events: 11,
+            duration_ms: 12.4,
+            client_messages: 4,
+            server_messages: 7,
+            invalid_messages: 0,
+            errors: 0,
+            last_method: Some("turn/completed".into()),
+        };
+        assert_eq!(serde_json::to_value(summary).unwrap(), expected);
+    }
+
+    #[test]
+    fn live_summary_tracks_lifecycle_and_protocol_counts() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("trace.jsonl");
+        let recorder = TraceRecorder::new(&path, &[OsString::from("mock")]).unwrap();
+        recorder
+            .record_line("client_to_server", b"not json\n")
+            .unwrap();
+        recorder
+            .record_line(
+                "server_to_client",
+                b"{\"method\":\"turn/completed\",\"error\":null}\n",
+            )
+            .unwrap();
+        let live = recorder.inspector_summary();
+        assert!(live.active);
+        assert!(!live.ended);
+        assert_eq!(live.events, 2);
+        assert_eq!(live.invalid_messages, 1);
+        assert_eq!(live.errors, 1);
+        assert_eq!(live.last_method.as_deref(), Some("turn/completed"));
+        recorder.close(Some(-9)).unwrap();
+        let closed = recorder.inspector_summary();
+        assert!(!closed.active);
+        assert!(closed.ended);
+        assert_eq!(closed.exit_code, Some(-9));
+    }
+
+    #[test]
+    fn close_is_idempotent_and_preserves_the_first_status() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("trace.jsonl");
+        let recorder = TraceRecorder::new(&path, &[]).unwrap();
+        recorder.close(Some(7)).unwrap();
+        recorder.close(Some(2)).unwrap();
+        recorder
+            .record_line("client_to_server", b"{\"method\":\"ignored\"}\n")
+            .unwrap();
+        let events = load_trace(&path).unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.get("kind") == Some(&json!("session_end")))
+                .count(),
+            1
+        );
+        assert_eq!(recorder.inspector_summary().exit_code, Some(7));
+        assert_eq!(recorder.inspector_summary().events, 0);
+    }
+
+    #[test]
+    fn served_summary_is_inactive_and_bounds_external_strings() {
+        let long = "🦀".repeat(300);
+        let events = vec![
+            json!({
+                "trace_version": 1,
+                "session_id": long,
+                "timestamp": "x".repeat(100),
+                "elapsed_ms": 1.25,
+                "direction": "meta",
+                "kind": "session_start",
+                "payload": {}
+            }),
+            json!({
+                "trace_version": 1,
+                "session_id": "ignored",
+                "elapsed_ms": 2.5,
+                "direction": "server_to_client",
+                "kind": "notification",
+                "method": "m".repeat(400),
+                "payload": {}
+            }),
+        ];
+        let summary = inspector_summary(&events, InspectorMode::ServedTrace);
+        assert!(!summary.active);
+        assert_eq!(summary.session_id.chars().count(), 128);
+        assert_eq!(summary.started_at.chars().count(), 64);
+        assert_eq!(summary.last_method.unwrap().chars().count(), 256);
+    }
+
+    #[test]
+    fn out_of_range_external_exit_code_is_null() {
+        let summary = inspector_summary(
+            &[json!({
+                "trace_version": 1,
+                "direction": "meta",
+                "kind": "session_end",
+                "payload": { "exit_code": 2147483648_i64 }
+            })],
+            InspectorMode::ServedTrace,
+        );
+        assert!(summary.ended);
+        assert_eq!(summary.exit_code, None);
     }
 }
