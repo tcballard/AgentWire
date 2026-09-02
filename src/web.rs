@@ -455,6 +455,9 @@ impl WebServer {
         let mut threads = Vec::new();
         for _ in 0..4 {
             let listener = listener.try_clone()?;
+            // A duplicated Windows socket does not reliably retain the
+            // non-blocking mode selected on the original handle.
+            listener.set_nonblocking(true)?;
             let thread_stop = Arc::clone(&stop);
             let thread_state = Arc::clone(&state);
             let thread_origin = origin.clone();
@@ -502,6 +505,10 @@ impl WebServer {
 impl Drop for WebServer {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
+        // Wake any platform-specific blocking accept before joining workers.
+        for _ in 0..self.threads.len() {
+            let _ = TcpStream::connect_timeout(&self.address, Duration::from_millis(100));
+        }
         for thread in self.threads.drain(..) {
             let _ = thread.join();
         }
