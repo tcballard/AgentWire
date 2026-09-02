@@ -1,21 +1,28 @@
+use crate::secure_fs::{
+    atomic_write_private, create_private_file, ensure_private_dir, open_bounded_file, random_hex,
+};
 use anyhow::{bail, Context, Result};
 use chrono::{SecondsFormat, Utc};
 use regex::{Captures, Regex};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::ffi::OsString;
-use std::fs::{File, OpenOptions};
-use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::fs::File;
+use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-#[cfg(unix)]
-use std::os::unix::fs::OpenOptionsExt;
-
 pub const TRACE_VERSION: u64 = 1;
 pub const INSPECTOR_API_VERSION: u64 = 1;
+pub const MAX_TRACE_BYTES: u64 = 64 * 1024 * 1024;
+pub const MAX_TRACE_EVENTS: u64 = 100_000;
+pub const MAX_TRACE_EVENT_BYTES: usize = 256 * 1024;
+pub const MAX_PROTOCOL_LINE_BYTES: usize = 1024 * 1024;
+pub const MAX_INSPECTOR_EVENTS: usize = 256;
+pub const MAX_INSPECTOR_EVENTS_BYTES: usize = 512 * 1024;
+pub const MAX_INSPECTOR_SNAPSHOT_BYTES: u64 = 1024 * 1024;
 pub const INSPECTOR_SESSION_ID_LIMIT: usize = 128;
 pub const INSPECTOR_STARTED_AT_LIMIT: usize = 64;
 pub const INSPECTOR_LAST_METHOD_LIMIT: usize = 256;
@@ -57,6 +64,8 @@ pub struct InspectorSummary {
 pub struct InspectorSnapshot {
     pub trace: PathBuf,
     pub summary: InspectorSummary,
+    #[serde(default)]
+    pub events: Vec<Value>,
 }
 
 impl InspectorSnapshot {
@@ -82,6 +91,11 @@ impl InspectorSnapshot {
         }
         if self.trace.as_os_str().is_empty() || !self.trace.is_absolute() {
             bail!("inspector snapshot trace path must be absolute");
+        }
+        if self.events.len() > MAX_INSPECTOR_EVENTS
+            || serde_json::to_vec(&self.events)?.len() > MAX_INSPECTOR_EVENTS_BYTES
+        {
+            bail!("inspector snapshot events exceed their bounds");
         }
         Ok(())
     }
@@ -333,7 +347,11 @@ fn session_id() -> String {
 struct RecorderState {
     writer: Option<BufWriter<File>>,
     sequence: u64,
+    bytes_written: u64,
+    limited: bool,
     inspector: InspectorAggregate,
+    inspector_events: VecDeque<(Value, usize)>,
+    inspector_event_bytes: usize,
 }
 
 pub struct TraceRecorder {
@@ -346,7 +364,7 @@ pub struct TraceRecorder {
 
 impl TraceRecorder {
     pub fn new(path: impl Into<PathBuf>, command: &[OsString]) -> Result<Self> {
-        Self::new_inner(path.into(), command, None)
+        Self::new_inner(path.into(), command, None, false)
     }
 
     pub fn new_published(
@@ -354,28 +372,26 @@ impl TraceRecorder {
         command: &[OsString],
         snapshot_path: impl Into<PathBuf>,
     ) -> Result<Self> {
-        Self::new_inner(path.into(), command, Some(snapshot_path.into()))
+        Self::new_inner(path.into(), command, Some(snapshot_path.into()), false)
+    }
+
+    pub fn new_private_published(
+        directory: &Path,
+        command: &[OsString],
+        snapshot_path: impl Into<PathBuf>,
+    ) -> Result<Self> {
+        ensure_private_dir(directory)?;
+        let path = directory.join(format!("agentwire-{}.jsonl", random_hex(16)?));
+        Self::new_inner(path, command, Some(snapshot_path.into()), true)
     }
 
     fn new_inner(
         path: PathBuf,
         command: &[OsString],
         snapshot_path: Option<PathBuf>,
+        private_parent: bool,
     ) -> Result<Self> {
-        if let Some(parent) = path
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-        {
-            std::fs::create_dir_all(parent).with_context(|| {
-                format!("could not create trace directory {}", parent.display())
-            })?;
-        }
-        let mut options = OpenOptions::new();
-        options.write(true).create(true).truncate(true);
-        #[cfg(unix)]
-        options.mode(0o600);
-        let file = options
-            .open(&path)
+        let file = create_private_file(&path, private_parent)
             .with_context(|| format!("could not create trace {}", path.display()))?;
         let recorder = Self {
             path,
@@ -385,7 +401,11 @@ impl TraceRecorder {
             state: Mutex::new(RecorderState {
                 writer: Some(BufWriter::new(file)),
                 sequence: 0,
+                bytes_written: 0,
+                limited: false,
                 inspector: InspectorAggregate::default(),
+                inspector_events: VecDeque::new(),
+                inspector_event_bytes: 0,
             }),
         };
         recorder.record_meta("session_start", json!({ "command": safe_command(command) }))?;
@@ -398,21 +418,57 @@ impl TraceRecorder {
 
     fn write_event(&self, mut event: Map<String, Value>) -> Result<()> {
         let mut state = self.state.lock().expect("trace recorder mutex poisoned");
-        if state.writer.is_none() {
+        if state.writer.is_none() || state.limited {
             return Ok(());
         }
         let sequence = state.sequence;
-        state.sequence += 1;
         event.insert("seq".into(), Value::from(sequence));
-        let writer = state.writer.as_mut().expect("writer checked above");
-        let event = Value::Object(event);
-        serde_json::to_writer(&mut *writer, &event)?;
-        writer.write_all(b"\n")?;
-        writer.flush()?;
-        state.inspector.observe(&event);
+        let (event, encoded) = bounded_trace_event(event)?;
+        let exceeds_limit = sequence >= MAX_TRACE_EVENTS.saturating_sub(2)
+            || state.bytes_written + encoded.len() as u64 > MAX_TRACE_BYTES.saturating_sub(4096);
+        if exceeds_limit {
+            let mut limited = json!({
+                "trace_version": TRACE_VERSION,
+                "session_id": self.session_id,
+                "timestamp": utc_now(),
+                "elapsed_ms": self.started.elapsed().as_secs_f64() * 1000.0,
+                "direction": "meta",
+                "kind": "trace_limited",
+                "method": null,
+                "id": null,
+                "payload": {
+                    "maximum_bytes": MAX_TRACE_BYTES,
+                    "maximum_events": MAX_TRACE_EVENTS
+                },
+                "seq": sequence
+            });
+            let encoded = serde_json::to_vec(&limited)?;
+            let writer = state.writer.as_mut().expect("writer checked above");
+            writer.write_all(&encoded)?;
+            writer.write_all(b"\n")?;
+            writer.flush()?;
+            state.bytes_written += (encoded.len() + 1) as u64;
+            state.sequence += 1;
+            state.inspector.observe(&limited);
+            push_inspector_event(&mut state, std::mem::take(&mut limited));
+            state.limited = true;
+        } else {
+            let writer = state.writer.as_mut().expect("writer checked above");
+            writer.write_all(&encoded)?;
+            writer.flush()?;
+            state.bytes_written += encoded.len() as u64;
+            state.sequence += 1;
+            state.inspector.observe(&event);
+            push_inspector_event(&mut state, event);
+        }
         let summary = state.inspector.summary(InspectorMode::LiveRecord);
+        let events = state
+            .inspector_events
+            .iter()
+            .map(|(event, _)| event.clone())
+            .collect();
         drop(state);
-        self.publish_snapshot(&summary)?;
+        self.publish_snapshot(&summary, events)?;
         Ok(())
     }
 
@@ -432,10 +488,14 @@ impl TraceRecorder {
     }
 
     pub fn record_line(&self, direction: &str, line: &[u8]) -> Result<()> {
-        let message = parse_message(line);
+        let message = if line.len() <= MAX_PROTOCOL_LINE_BYTES {
+            parse_message(line)
+        } else {
+            None
+        };
         let (kind, method, id) = classify_message(message.as_ref());
         let payload = message.as_ref().map(redact).unwrap_or_else(
-            || json!({ "omitted": "non-JSON protocol line", "length": line.len() }),
+            || json!({ "omitted": "invalid or oversized protocol line", "length": line.len() }),
         );
         let event = json!({
             "trace_version": TRACE_VERSION,
@@ -473,17 +533,25 @@ impl TraceRecorder {
         event.insert("seq".into(), Value::from(state.sequence));
         state.sequence += 1;
         let value = Value::Object(event);
+        let encoded = serde_json::to_vec(&value)?;
         let writer = state.writer.as_mut().expect("writer checked above");
-        serde_json::to_writer(&mut *writer, &value)?;
+        writer.write_all(&encoded)?;
         writer.write_all(b"\n")?;
         writer.flush()?;
+        state.bytes_written += (encoded.len() + 1) as u64;
         state.inspector.observe(&value);
+        push_inspector_event(&mut state, value);
         let summary = state.inspector.summary(InspectorMode::LiveRecord);
+        let events = state
+            .inspector_events
+            .iter()
+            .map(|(event, _)| event.clone())
+            .collect();
         if let Some(mut writer) = state.writer.take() {
             writer.flush()?;
         }
         drop(state);
-        self.publish_snapshot(&summary)?;
+        self.publish_snapshot(&summary, events)?;
         Ok(())
     }
 
@@ -495,7 +563,17 @@ impl TraceRecorder {
             .summary(InspectorMode::LiveRecord)
     }
 
-    fn publish_snapshot(&self, summary: &InspectorSummary) -> Result<()> {
+    pub fn inspector_events(&self) -> Vec<Value> {
+        self.state
+            .lock()
+            .expect("trace recorder mutex poisoned")
+            .inspector_events
+            .iter()
+            .map(|(event, _)| event.clone())
+            .collect()
+    }
+
+    fn publish_snapshot(&self, summary: &InspectorSummary, events: Vec<Value>) -> Result<()> {
         let Some(path) = self.snapshot_path.as_deref() else {
             return Ok(());
         };
@@ -508,102 +586,117 @@ impl TraceRecorder {
             &InspectorSnapshot {
                 trace,
                 summary: summary.clone(),
+                events,
             },
         )
     }
 }
 
+fn bounded_trace_event(mut event: Map<String, Value>) -> Result<(Value, Vec<u8>)> {
+    let mut value = Value::Object(event.clone());
+    let mut encoded = serde_json::to_vec(&value)?;
+    if encoded.len() + 1 > MAX_TRACE_EVENT_BYTES {
+        let original_bytes = encoded.len();
+        event.insert(
+            "payload".into(),
+            json!({ "omitted": "event exceeded trace event limit", "serialized_bytes": original_bytes }),
+        );
+        event.insert("kind".into(), Value::String("limited".into()));
+        event.insert("method".into(), Value::Null);
+        event.insert("id".into(), Value::Null);
+        value = Value::Object(event);
+        encoded = serde_json::to_vec(&value)?;
+    }
+    encoded.push(b'\n');
+    Ok((value, encoded))
+}
+
+fn push_inspector_event(state: &mut RecorderState, event: Value) {
+    let bytes =
+        serde_json::to_vec(&event).map_or(MAX_INSPECTOR_EVENTS_BYTES + 1, |value| value.len());
+    if bytes > MAX_INSPECTOR_EVENTS_BYTES {
+        return;
+    }
+    state.inspector_events.push_back((event, bytes));
+    state.inspector_event_bytes += bytes;
+    while state.inspector_events.len() > MAX_INSPECTOR_EVENTS
+        || state.inspector_event_bytes > MAX_INSPECTOR_EVENTS_BYTES
+    {
+        if let Some((_, removed)) = state.inspector_events.pop_front() {
+            state.inspector_event_bytes = state.inspector_event_bytes.saturating_sub(removed);
+        }
+    }
+}
+
 pub fn write_inspector_snapshot(path: &Path, snapshot: &InspectorSnapshot) -> Result<()> {
     snapshot.validate()?;
-    let parent = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .context("inspector snapshot path needs a parent directory")?;
-    if !parent.exists() {
-        let mut builder = std::fs::DirBuilder::new();
-        builder.recursive(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::DirBuilderExt;
-            builder.mode(0o700);
-        }
-        builder
-            .create(parent)
-            .with_context(|| format!("could not create snapshot directory {}", parent.display()))?;
+    let mut encoded = serde_json::to_vec(snapshot)?;
+    encoded.push(b'\n');
+    if encoded.len() as u64 > MAX_INSPECTOR_SNAPSHOT_BYTES {
+        bail!("inspector snapshot exceeds its byte limit");
     }
-    if std::fs::symlink_metadata(parent)?.file_type().is_symlink() {
-        bail!("inspector snapshot directory must not be a symlink");
-    }
-
-    let nonce = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let temporary = parent.join(format!(
-        ".{}.tmp-{}-{nonce}",
-        path.file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("inspector"),
-        std::process::id()
-    ));
-    let result = (|| -> Result<()> {
-        let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        options.mode(0o600);
-        let mut file = options
-            .open(&temporary)
-            .with_context(|| format!("could not create snapshot {}", temporary.display()))?;
-        serde_json::to_writer(&mut file, snapshot)?;
-        file.write_all(b"\n")?;
-        file.sync_all()?;
-        std::fs::rename(&temporary, path)
-            .with_context(|| format!("could not publish snapshot {}", path.display()))?;
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = std::fs::remove_file(&temporary);
-    }
-    result
+    atomic_write_private(path, &encoded)
 }
 
 pub fn load_inspector_snapshot(path: &Path) -> Result<InspectorSnapshot> {
-    const MAX_SNAPSHOT_BYTES: u64 = 64 * 1024;
-    let metadata = std::fs::symlink_metadata(path)
-        .with_context(|| format!("could not inspect snapshot {}", path.display()))?;
-    if !metadata.file_type().is_file() || metadata.len() > MAX_SNAPSHOT_BYTES {
-        bail!("inspector snapshot is not a bounded regular file");
-    }
-    let snapshot: InspectorSnapshot = serde_json::from_reader(BufReader::new(
-        File::open(path).with_context(|| format!("could not open snapshot {}", path.display()))?,
-    ))?;
+    let file = open_bounded_file(path, MAX_INSPECTOR_SNAPSHOT_BYTES, true)
+        .with_context(|| format!("could not securely open snapshot {}", path.display()))?;
+    let snapshot: InspectorSnapshot = serde_json::from_reader(BufReader::new(file))?;
     snapshot.validate()?;
     Ok(snapshot)
 }
 
 pub fn load_trace(path: &Path) -> Result<Vec<Value>> {
-    let file =
-        File::open(path).with_context(|| format!("could not open trace {}", path.display()))?;
+    let file = open_bounded_file(path, MAX_TRACE_BYTES, false)
+        .with_context(|| format!("could not securely open trace {}", path.display()))?;
     let mut events = Vec::new();
-    for (index, line) in BufReader::new(file).lines().enumerate() {
-        let line = line?;
+    let mut reader = BufReader::new(file);
+    let mut line = Vec::new();
+    let mut index = 0_usize;
+    loop {
+        line.clear();
+        let length = (&mut reader)
+            .take((MAX_TRACE_EVENT_BYTES + 1) as u64)
+            .read_until(b'\n', &mut line)?;
+        if length == 0 {
+            break;
+        }
+        index += 1;
+        if line.len() > MAX_TRACE_EVENT_BYTES || events.len() as u64 >= MAX_TRACE_EVENTS {
+            bail!("trace exceeds its event bounds");
+        }
+        let line = std::str::from_utf8(&line)?;
         if line.trim().is_empty() {
             continue;
         }
-        let event: Value = serde_json::from_str(&line)
-            .with_context(|| format!("invalid trace JSON on line {}", index + 1))?;
+        let event: Value = serde_json::from_str(line)
+            .with_context(|| format!("invalid trace JSON on line {index}"))?;
         if !event.is_object() {
-            bail!(
-                "invalid trace event on line {}: expected an object",
-                index + 1
-            );
+            bail!("invalid trace event on line {index}: expected an object");
         }
         if event.get("trace_version").and_then(Value::as_u64) != Some(TRACE_VERSION) {
-            bail!("unsupported trace version on line {}", index + 1);
+            bail!("unsupported trace version on line {index}");
         }
         events.push(event);
     }
     Ok(events)
+}
+
+pub fn write_auth_token(path: &Path) -> Result<String> {
+    let token = random_hex(32)?;
+    atomic_write_private(path, format!("{token}\n").as_bytes())?;
+    Ok(token)
+}
+
+pub fn read_auth_token(path: &Path) -> Result<String> {
+    let mut file = open_bounded_file(path, 256, true)?;
+    let mut token = String::new();
+    file.read_to_string(&mut token)?;
+    let token = token.trim();
+    if token.len() != 64 || !token.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        bail!("invalid inspector authorization token");
+    }
+    Ok(token.to_owned())
 }
 
 pub fn inspector_summary(events: &[Value], mode: InspectorMode) -> InspectorSummary {
@@ -927,6 +1020,7 @@ mod tests {
         std::fs::write(&trace, b"").unwrap();
         let bad = InspectorSnapshot {
             trace: trace.canonicalize().unwrap(),
+            events: vec![],
             summary: InspectorSummary {
                 api_version: 1,
                 trace_version: 1,
