@@ -1,9 +1,10 @@
 use agentwire::core::{
-    load_trace, method_of, parse_message, remember_request_id, rewrite_response_id, summarize,
-    TraceRecorder,
+    load_trace, method_of, parse_message, read_auth_token, remember_request_id,
+    rewrite_response_id, summarize, TraceRecorder, MAX_PROTOCOL_LINE_BYTES,
 };
 use agentwire::diff::{compare_traces, ComparableEvent, IgnoreRule, TraceDiff};
 use agentwire::replay::plan_replay;
+use agentwire::secure_fs::random_hex;
 use agentwire::web::{hub_forever, serve_forever, WebServer};
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand};
@@ -35,6 +36,9 @@ enum Commands {
         /// Trace output path (default: timestamped JSONL).
         #[arg(long)]
         trace: Option<PathBuf>,
+        /// Private directory for an exclusively-created, random trace file.
+        #[arg(long, value_name = "PATH", conflicts_with = "trace")]
+        trace_dir: Option<PathBuf>,
         /// Serve the live inspector, optionally at HOST:PORT.
         #[arg(long, num_args = 0..=1, default_missing_value = "127.0.0.1:4777")]
         ui: Option<String>,
@@ -94,6 +98,14 @@ enum Commands {
         state: PathBuf,
         #[arg(long, default_value = "127.0.0.1:4777")]
         listen: String,
+        /// Private file where the hub publishes its current authorization token.
+        #[arg(long, value_name = "PATH")]
+        auth_token_file: Option<PathBuf>,
+    },
+    /// Read a securely-published inspector authorization token.
+    AuthToken {
+        #[arg(long, value_name = "PATH")]
+        file: PathBuf,
     },
     /// Check whether a selected JSONL server command is available to wrap.
     Doctor {
@@ -103,23 +115,34 @@ enum Commands {
     },
 }
 
-fn default_trace_path() -> PathBuf {
-    PathBuf::from(format!(
+fn default_trace_path() -> Result<PathBuf> {
+    Ok(PathBuf::from(format!(
         "agentwire-{}.jsonl",
-        chrono::Utc::now().format("%Y%m%dT%H%M%SZ")
-    ))
+        random_hex(16)?
+    )))
 }
 
 fn record(
     trace: Option<PathBuf>,
+    trace_dir: Option<PathBuf>,
     ui: Option<String>,
     publish_summary: Option<PathBuf>,
     command: Vec<OsString>,
 ) -> Result<i32> {
-    let trace = trace.unwrap_or_else(default_trace_path);
-    let recorder = Arc::new(match publish_summary {
-        Some(snapshot) => TraceRecorder::new_published(&trace, &command, snapshot)?,
-        None => TraceRecorder::new(&trace, &command)?,
+    let recorder = Arc::new(match (trace, trace_dir, publish_summary) {
+        (Some(trace), None, Some(snapshot)) => {
+            TraceRecorder::new_published(&trace, &command, snapshot)?
+        }
+        (Some(trace), None, None) => TraceRecorder::new(&trace, &command)?,
+        (None, Some(directory), Some(snapshot)) => {
+            TraceRecorder::new_private_published(&directory, &command, snapshot)?
+        }
+        (None, Some(_), None) => bail!("--trace-dir requires --publish-summary"),
+        (None, None, Some(snapshot)) => {
+            TraceRecorder::new_published(&default_trace_path()?, &command, snapshot)?
+        }
+        (None, None, None) => TraceRecorder::new(&default_trace_path()?, &command)?,
+        (Some(_), Some(_), _) => unreachable!("clap rejects conflicting trace destinations"),
     });
     let inspector = ui
         .as_deref()
@@ -160,9 +183,9 @@ fn record(
         let mut line = Vec::new();
         loop {
             line.clear();
-            match input.read_until(b'\n', &mut line) {
-                Ok(0) => break,
-                Ok(_) => {
+            match read_bounded_line(&mut input, &mut line, MAX_PROTOCOL_LINE_BYTES) {
+                Ok((0, _)) => break,
+                Ok((_, false)) => {
                     let _ = input_recorder.record_line("client_to_server", &line);
                     if child_input
                         .write_all(&line)
@@ -171,6 +194,13 @@ fn record(
                     {
                         break;
                     }
+                }
+                Ok((_, true)) => {
+                    let _ = input_recorder.record_meta(
+                        "protocol_limit",
+                        serde_json::json!({ "direction": "client_to_server" }),
+                    );
+                    break;
                 }
                 Err(_) => break,
             }
@@ -184,8 +214,20 @@ fn record(
     let mut line = Vec::new();
     loop {
         line.clear();
-        if output.read_until(b'\n', &mut line)? == 0 {
+        let (length, oversized) =
+            read_bounded_line(&mut output, &mut line, MAX_PROTOCOL_LINE_BYTES)?;
+        if length == 0 {
             break;
+        }
+        if oversized {
+            recorder.record_meta(
+                "protocol_limit",
+                serde_json::json!({ "direction": "server_to_client" }),
+            )?;
+            let _ = child.kill();
+            let _ = child.wait();
+            recorder.close(None)?;
+            bail!("child emitted a protocol line larger than {MAX_PROTOCOL_LINE_BYTES} bytes");
         }
         recorder.record_line("server_to_client", &line)?;
         client_output.write_all(&line)?;
@@ -196,6 +238,39 @@ fn record(
     recorder.close(status.code())?;
     drop(inspector);
     Ok(status.code().unwrap_or(1))
+}
+
+fn read_bounded_line<R: BufRead>(
+    reader: &mut R,
+    output: &mut Vec<u8>,
+    limit: usize,
+) -> io::Result<(usize, bool)> {
+    output.clear();
+    let mut total = 0_usize;
+    let mut oversized = false;
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            return Ok((total, oversized));
+        }
+        let consumed = available
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(available.len(), |index| index + 1);
+        total = total.saturating_add(consumed);
+        if output.len() < limit {
+            let retained = consumed.min(limit - output.len());
+            output.extend_from_slice(&available[..retained]);
+            oversized |= retained < consumed;
+        } else {
+            oversized = true;
+        }
+        let ended = available[..consumed].last() == Some(&b'\n');
+        reader.consume(consumed);
+        if ended {
+            return Ok((total, oversized));
+        }
+    }
 }
 
 fn inspect(trace: PathBuf, as_json: bool) -> Result<i32> {
@@ -467,10 +542,11 @@ fn run() -> Result<i32> {
     match Cli::parse().command {
         Commands::Record {
             trace,
+            trace_dir,
             ui,
             publish_summary,
             command,
-        } => record(trace, ui, publish_summary, command),
+        } => record(trace, trace_dir, ui, publish_summary, command),
         Commands::Inspect { trace, json } => inspect(trace, json),
         Commands::Diff {
             left,
@@ -486,7 +562,15 @@ fn run() -> Result<i32> {
             strict_payload,
         } => replay(trace, speed, strict_payload),
         Commands::Serve { trace, listen } => serve_forever(trace, &listen).map(|_| 0),
-        Commands::Hub { state, listen } => hub_forever(state, &listen).map(|_| 0),
+        Commands::Hub {
+            state,
+            listen,
+            auth_token_file,
+        } => hub_forever(state, &listen, auth_token_file.as_deref()).map(|_| 0),
+        Commands::AuthToken { file } => {
+            println!("{}", read_auth_token(&file)?);
+            Ok(0)
+        }
         Commands::Doctor { command } => doctor(command),
     }
 }
