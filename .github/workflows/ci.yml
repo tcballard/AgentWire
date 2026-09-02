@@ -23,3 +23,21 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --all-targets --all-features -- -D warnings
       - run: cargo test --all-targets --all-features
+
+  linux-bundle:
+    name: Linux x86-64 bundle
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.0
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --locked
+      - run: cp target/release/agentwire agentwire-x86_64
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: agentwire-${{ github.sha }}-x86_64-unknown-linux-gnu
+          path: agentwire-x86_64
+          compression-level: 0
+          retention-days: 7
