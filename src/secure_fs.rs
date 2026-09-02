@@ -1,7 +1,7 @@
 use anyhow::{bail, Context, Result};
 use std::fs::File;
 use std::io::Write;
-use std::path::{Component, Path};
+use std::path::Path;
 
 pub fn random_hex(bytes: usize) -> Result<String> {
     let mut value = vec![0_u8; bytes];
@@ -16,6 +16,7 @@ mod unix {
     use std::ffi::{CString, OsStr};
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     use std::os::unix::ffi::OsStrExt;
+    use std::path::Component;
 
     fn c_name(name: &OsStr) -> Result<CString> {
         CString::new(name.as_bytes()).context("path contains a NUL byte")
