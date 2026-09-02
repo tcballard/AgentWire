@@ -13,7 +13,7 @@ pub fn random_hex(bytes: usize) -> Result<String> {
 #[cfg(unix)]
 mod unix {
     use super::*;
-    use std::ffi::{CString, OsStr};
+    use std::ffi::{CStr, CString, OsStr};
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     use std::os::unix::ffi::OsStrExt;
     use std::path::Component;
@@ -244,6 +244,79 @@ mod unix {
         }
         result
     }
+
+    pub fn retain_files(
+        path: &Path,
+        prefix: &str,
+        suffix: &str,
+        maximum_files: usize,
+        maximum_bytes: u64,
+    ) -> Result<()> {
+        let directory = open_directory(path, true, true)?;
+        let scan_fd = unsafe { libc::dup(directory.as_raw_fd()) };
+        if scan_fd < 0 {
+            return Err(std::io::Error::last_os_error()).context("could not scan trace directory");
+        }
+        let stream = unsafe { libc::fdopendir(scan_fd) };
+        if stream.is_null() {
+            unsafe { libc::close(scan_fd) };
+            return Err(std::io::Error::last_os_error()).context("could not scan trace directory");
+        }
+
+        let mut files = Vec::new();
+        loop {
+            let entry = unsafe { libc::readdir(stream) };
+            if entry.is_null() {
+                break;
+            }
+            let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) };
+            let Ok(name_text) = name.to_str() else {
+                continue;
+            };
+            if !name_text.starts_with(prefix) || !name_text.ends_with(suffix) {
+                continue;
+            }
+            let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+            if unsafe {
+                libc::fstatat(
+                    directory.as_raw_fd(),
+                    name.as_ptr(),
+                    stat.as_mut_ptr(),
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            } != 0
+            {
+                continue;
+            }
+            let stat = unsafe { stat.assume_init() };
+            if stat.st_mode & libc::S_IFMT != libc::S_IFREG
+                || stat.st_uid != unsafe { libc::geteuid() }
+            {
+                continue;
+            }
+            let modified = (stat.st_mtime, stat.st_mtime_nsec);
+            files.push((name.to_owned(), stat.st_size.max(0) as u64, modified));
+        }
+        unsafe { libc::closedir(stream) };
+
+        files.sort_by(|left, right| right.2.cmp(&left.2).then_with(|| right.0.cmp(&left.0)));
+        let mut kept_files = 0_usize;
+        let mut kept_bytes = 0_u64;
+        for (name, bytes, _) in files {
+            if kept_files < maximum_files && kept_bytes.saturating_add(bytes) <= maximum_bytes {
+                kept_files += 1;
+                kept_bytes += bytes;
+                continue;
+            }
+            if unsafe { libc::unlinkat(directory.as_raw_fd(), name.as_ptr(), 0) } != 0 {
+                let error = std::io::Error::last_os_error();
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    return Err(error).context("could not enforce trace retention");
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 #[cfg(not(unix))]
@@ -291,6 +364,42 @@ mod portable {
         std::fs::rename(&temporary, path)?;
         Ok(())
     }
+
+    pub fn retain_files(
+        path: &Path,
+        prefix: &str,
+        suffix: &str,
+        maximum_files: usize,
+        maximum_bytes: u64,
+    ) -> Result<()> {
+        ensure_private_dir(path)?;
+        let mut files = std::fs::read_dir(path)?
+            .filter_map(|entry| entry.ok())
+            .filter_map(|entry| {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if !name.starts_with(prefix) || !name.ends_with(suffix) {
+                    return None;
+                }
+                let metadata = entry.metadata().ok()?;
+                if !metadata.is_file() {
+                    return None;
+                }
+                Some((entry.path(), metadata.len(), metadata.modified().ok()))
+            })
+            .collect::<Vec<_>>();
+        files.sort_by(|left, right| right.2.cmp(&left.2).then_with(|| right.0.cmp(&left.0)));
+        let mut kept_files = 0_usize;
+        let mut kept_bytes = 0_u64;
+        for (file, bytes, _) in files {
+            if kept_files < maximum_files && kept_bytes.saturating_add(bytes) <= maximum_bytes {
+                kept_files += 1;
+                kept_bytes += bytes;
+            } else {
+                std::fs::remove_file(file)?;
+            }
+        }
+        Ok(())
+    }
 }
 
 pub fn ensure_private_dir(path: &Path) -> Result<()> {
@@ -319,6 +428,19 @@ pub fn atomic_write_private(path: &Path, contents: &[u8]) -> Result<()> {
     return unix::atomic_write(path, contents);
     #[cfg(not(unix))]
     return portable::atomic_write(path, contents);
+}
+
+pub fn retain_private_files(
+    path: &Path,
+    prefix: &str,
+    suffix: &str,
+    maximum_files: usize,
+    maximum_bytes: u64,
+) -> Result<()> {
+    #[cfg(unix)]
+    return unix::retain_files(path, prefix, suffix, maximum_files, maximum_bytes);
+    #[cfg(not(unix))]
+    return portable::retain_files(path, prefix, suffix, maximum_files, maximum_bytes);
 }
 
 #[cfg(all(test, unix))]
@@ -352,5 +474,30 @@ mod tests {
         let linked = directory.path().join("linked.jsonl");
         symlink(&actual, &linked).unwrap();
         assert!(open_bounded_file(&linked, 1024, false).is_err());
+    }
+
+    #[test]
+    fn retention_removes_only_excess_matching_regular_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let traces = directory.path().join("traces");
+        ensure_private_dir(&traces).unwrap();
+        for index in 0..4 {
+            let path = traces.join(format!("agentwire-{index}.jsonl"));
+            let mut file = create_private_file(&path, true).unwrap();
+            file.write_all(b"1234").unwrap();
+        }
+        std::fs::write(traces.join("keep.txt"), b"unrelated").unwrap();
+        retain_private_files(&traces, "agentwire-", ".jsonl", 2, 8).unwrap();
+        let matching = std::fs::read_dir(&traces)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                name.starts_with("agentwire-") && name.ends_with(".jsonl")
+            })
+            .count();
+        assert_eq!(matching, 2);
+        assert!(traces.join("keep.txt").exists());
     }
 }

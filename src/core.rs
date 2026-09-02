@@ -1,5 +1,6 @@
 use crate::secure_fs::{
     atomic_write_private, create_private_file, ensure_private_dir, open_bounded_file, random_hex,
+    retain_private_files,
 };
 use anyhow::{bail, Context, Result};
 use chrono::{SecondsFormat, Utc};
@@ -17,6 +18,8 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 pub const TRACE_VERSION: u64 = 1;
 pub const INSPECTOR_API_VERSION: u64 = 1;
 pub const MAX_TRACE_BYTES: u64 = 64 * 1024 * 1024;
+pub const MAX_RETAINED_TRACES: usize = 32;
+pub const MAX_RETAINED_TRACE_BYTES: u64 = 512 * 1024 * 1024;
 pub const MAX_TRACE_EVENTS: u64 = 100_000;
 pub const MAX_TRACE_EVENT_BYTES: usize = 256 * 1024;
 pub const MAX_PROTOCOL_LINE_BYTES: usize = 1024 * 1024;
@@ -381,6 +384,13 @@ impl TraceRecorder {
         snapshot_path: impl Into<PathBuf>,
     ) -> Result<Self> {
         ensure_private_dir(directory)?;
+        retain_private_files(
+            directory,
+            "agentwire-",
+            ".jsonl",
+            MAX_RETAINED_TRACES - 1,
+            MAX_RETAINED_TRACE_BYTES - MAX_TRACE_BYTES,
+        )?;
         let path = directory.join(format!("agentwire-{}.jsonl", random_hex(16)?));
         Self::new_inner(path, command, Some(snapshot_path.into()), true)
     }
