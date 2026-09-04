@@ -5,6 +5,7 @@ use agentwire::core::{
 use agentwire::diff::{compare_traces, ComparableEvent, IgnoreRule, TraceDiff};
 use agentwire::replay::plan_replay;
 use agentwire::secure_fs::random_hex;
+use agentwire::system_action;
 use agentwire::web::{hub_forever, serve_forever, WebServer};
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand};
@@ -107,12 +108,26 @@ enum Commands {
         #[arg(long, value_name = "PATH")]
         file: PathBuf,
     },
+    /// Run an allowlisted desktop action for an attested integration.
+    #[command(hide = true)]
+    SystemAction {
+        #[command(subcommand)]
+        action: SystemActions,
+    },
     /// Check whether a selected JSONL server command is available to wrap.
     Doctor {
         /// Server command to resolve without launching it (default: codex app-server).
         #[arg(last = true)]
         command: Vec<OsString>,
     },
+}
+
+#[derive(Subcommand)]
+enum SystemActions {
+    /// Copy one value through the trusted system Wayland clipboard helper.
+    Copy { value: OsString },
+    /// Open one path through the trusted system desktop opener.
+    Open { path: PathBuf },
 }
 
 fn default_trace_path() -> Result<PathBuf> {
@@ -571,6 +586,10 @@ fn run() -> Result<i32> {
             println!("{}", read_auth_token(&file)?);
             Ok(0)
         }
+        Commands::SystemAction { action } => match action {
+            SystemActions::Copy { value } => system_action::copy(value),
+            SystemActions::Open { path } => system_action::open(path),
+        },
         Commands::Doctor { command } => doctor(command),
     }
 }
